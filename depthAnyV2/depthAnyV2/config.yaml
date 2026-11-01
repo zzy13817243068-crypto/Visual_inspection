@@ -1,0 +1,358 @@
+# ====================================================================
+# Depth Anything V2 度量深度项目 - 统一配置文件
+# ====================================================================
+# 修改本文件即可调整所有脚本参数，无需改代码或传命令行参数。
+# 命令行参数（如有）会覆盖本文件的值。
+# ====================================================================
+
+# ===== 路径配置 =====
+paths:
+  # 原始训练图片目录（放 JPG/PNG 图片）
+  image_dir: datasets/my_dataset/images
+  # 数据准备输出目录（prepare_data.py 生成伪标签）
+  processed_dir: datasets/my_dataset/processed
+  # 训练模型保存目录
+  checkpoint_dir: checkpoints/my_model
+  # 评估结果输出目录
+  eval_dir: eval_results
+  # 推理输入目录（放待验证图片/视频）
+  detect_input: detect/input
+  # 推理输出目录
+  detect_output: detect/output
+
+# ===== 模型配置 =====
+model:
+  # 教师模型（生成米数伪标签，越大越准）
+  teacher: depth-anything/Depth-Anything-V2-Metric-Outdoor-Large-hf
+  # 学生模型（实际微调的目标模型）
+  student: depth-anything/Depth-Anything-V2-Metric-Outdoor-Base-hf
+  # 评估基准模型（对比用，默认与学生相同）
+  base: depth-anything/Depth-Anything-V2-Metric-Outdoor-Base-hf
+
+# ===== 训练配置 (train.py) =====
+train:
+  # 训练阶段: 1=Head微调(快), 2=全量微调(慢但更精)
+  stage: 2
+  # 训练轮数
+  epochs: 40
+  # 批大小 (8GB显存建议1-2, 16GB可设4)
+  batch_size: 4
+  # 处理分辨率 (须为14的倍数, DA2默认518)
+  process_res: 518
+  # 梯度累积步数 (等效batch = batch_size × grad_accumulate)
+  grad_accumulate: 4
+  # 恢复训练的checkpoint路径 (null=从头开始)
+  # 中断后续跑：改为 checkpoints/my_model/latest_model.pt 即可从断点完整恢复
+  # Stage 2 从 Stage 1 的 best_model.pt 继续训练（backbone+head 联合微调）
+  resume: checkpoints/my_model/best_model.pt
+
+# ===== 评估配置 (evaluate.py) =====
+eval:
+  # 微调模型路径 (null=只评估预训练模型)
+  checkpoint: checkpoints/my_model/best_model.pt
+  # 是否同时运行预训练模型对比
+  compare: true
+
+# ===== 推理配置 (detect.py) =====
+detect:
+  # 推理模型路径 (null=用预训练官方模型)
+  model_depth: checkpoints/my_model/best_model.pt
+  # 计算设备
+  device: cuda
+  # 视频帧采样间隔 (1=每帧都处理, 2=隔帧处理)
+  frame_step: 1
+  # 视频最大处理帧数 (null=处理全部)
+  max_frames: null
+  # 是否保存每帧深度数据 .npz (1=保存但慢, 0=不保存更快，只出视频，默认关闭)
+  save_depth: 0
+
+  # ===== 预览模式配置 =====
+  # 是否启用预览模式 (true=随机选取文件用 OpenCV imshow 显示，不保存到磁盘，节省内存)
+  # 数据类型: 布尔值 | 默认值: true | 使用条件: 启用后不保存结果文件
+  preview_enabled: true
+  # 随机选取的文件数量 (从输入目录中随机抽取 N 个文件进行预览)
+  # 数据类型: 整数 | 默认值: 3 | 使用条件: 仅在 preview_enabled=true 时生效
+  # 设为 0 表示处理全部文件
+  preview_count: 20
+
+  # ===== 像素点深度监测配置 =====
+  # 是否启用自定义像素点深度监测 (true=在视频中标记指定像素点并实时显示其深度值)
+  # 数据类型: 布尔值 | 默认值: true | 使用条件: 启用后在视频/图片上显示监测点
+  pixel_depth_enabled: true
+  # 监测像素点列表 (格式: "x1,y1;x2,y2;x3,y3"，用分号分隔多个点)
+  # 数据类型: 字符串 | 默认值: ""(空) | 使用条件: 仅在 pixel_depth_enabled=true 时生效
+  # 留空或不填时自动在画面中分线上均匀分布 pixel_depth_count 个监测点
+  # 示例: "320,240;640,480;800,600" 表示3个自定义点
+  pixel_depth_points: ""
+  # 自动生成的监测点数量 (仅当 pixel_depth_points 为空时生效)
+  # 数据类型: 整数 | 默认值: 15 | 使用条件: 启用但未指定自定义坐标时
+  # 设为15时自动生成非对称双列：x=40共7个点 + x=55共8个点
+  # 设为14时自动生成对称双列：x=40共7个点 + x=55共7个点（聚合模式）
+  # 设为7时在x=40单列生成7个点
+  pixel_depth_count: 15
+
+# ===== 车辆检测配置 (detect_car.py) =====
+car_detect:
+  # 输入目录（放待检测视频，支持子目录递归读取）
+  input_dir: detect/input
+  # 输出根目录（每次运行在其下创建带时间戳的子目录）
+  output_dir: detect/car_output
+  # 随机选取的视频数量 (0=处理全部)
+  # 数据类型: 整数 | 默认值: 5 | 使用条件: 输入为目录时随机抽取N个视频
+  preview_count: 5
+  # 处理帧采样间隔 (1=每帧都处理, 2=隔帧处理, 以此类推)
+  # 数据类型: 整数 | 默认值: 1 | 范围: 1~10
+  # 值越大处理越快但检测精度降低，同时控制截取帧密度
+  frame_step: 1
+  # 随机种子 (null=每次随机, 整数=可复现)
+  # 数据类型: 整数或null | 默认值: null
+  seed: null
+
+  # ===== YOLO 视觉检测配置 =====
+  yolo:
+    # 是否启用 YOLO 视觉检测（与深度规则协同，不是独立运行）
+    # 数据类型: 布尔值 | 默认值: true
+    enabled: true
+    # YOLO 模型文件路径（.pt 权重文件）
+    # 支持: 自定义训练 best.pt / 官方 yolov8n.pt 等
+    # 推荐：把你的 .pt 文件放进 checkpoints/yolo/ 目录（已经创建好），这里写相对路径
+    # 例: checkpoints/yolo/best.pt  → 对应文件 checkpoints/yolo/best.pt
+    model_path: checkpoints/yolo/best.pt
+    # 计算设备: cuda / cpu（默认与深度模型相同）
+    device: ""
+    # 置信度阈值(0~1): 低于此值的 YOLO 检测框被忽略
+    confidence: 0.40
+    # IoU NMS 阈值(0~1): 去重检测框
+    iou: 0.45
+    # 你自定义训练的模型类别编号（车 = 类别0）
+    # 如果是多类别自定义模型，把所有代表"车辆/卡车/公交/摩托"的编号写进来
+    vehicle_classes: [0]
+    # 车辆进入检测区域判定：
+    # 检测框底部与画面底部距离占比阈值（越小表示越靠近底部/检测线）
+    # 例 0.30: 检测框底部在画面下方 30% 范围内时视为进入检测区
+    enter_bottom_ratio: 0.30
+    # 检测框最小尺寸占比(0~1): 过滤远处极小的误检框
+    min_box_ratio: 0.02
+
+  # ===== 多规则融合权重配置（深度变化+视觉高权重，合计 90%） =====
+  # 所有权重总和 = 1.00 (100%)
+  weights:
+    # 深度变化相关 (高权重，合计 70%)
+    R1_way4_depth_jump: 0.10    # Way4 深度骤变检测
+    R2_way5_abs_depth: 0.25     # Way5 绝对深度分布 (原 R2，主规则)
+    R3_way1_baseline: 0.25      # Way1 基线对比下降 (原 R3，主规则)
+    R4_vehicle_region: 0.10     # Way 车辆区域统计特征
+    # 视觉检测 (高权重，合计 20%)
+    R5_yolo_vision: 0.30        # R5: YOLO 视觉检测 - 车+进入检测区
+
+  # 加权综合判定阈值 (≥此值判定有车，置信度范围 0~1)
+  # 数据类型: 浮点数 | 默认值: 0.470
+  car_confidence_threshold: 0.470
+
+  # 距离骤减阈值(m): 单个监测点深度减少超过此值视为该点被车辆遮挡
+  # 数据类型: 浮点数 | 默认值: 0.4 | 范围: 0.1~10.0
+  # 非对称双列模式下车辆距离较远，深度变化较小，阈值需降低
+  distance_drop_threshold: 0.4
+  # 正常波动阈值(m): 单个监测点深度偏差小于此值视为该点稳定
+  # 数据类型: 浮点数 | 默认值: 1.5 | 范围: 0.2~3.0
+  # 深度模型本身有误差，值太小会导致很多点不稳定
+  normal_fluctuation: 1.5
+  # 判定有车所需的最少骤减点数(多点投票)
+  # 数据类型: 整数 | 默认值: 2 | 范围: 1~n_points
+  # 需要至少2个点同时检测到异常，避免单点噪声误判
+  min_car_points: 2
+  # 判定无车所需的最少稳定点数(多数稳定，仅统计路面可靠点)
+  # 数据类型: 整数 | 默认值: 3 | 范围: 1~n_points
+  # 不要求所有点都稳定，多数点稳定即可判定无车
+  min_stable_points: 3
+  # 参与车辆检测的最大基线深度(m): 超过此值的点视为天空/远景，不参与判车
+  # 数据类型: 浮点数 | 默认值: 30.0 | 范围: 5.0~80.0
+  # 深度模型对天空区域估算极不稳定，必须过滤掉
+  max_detect_depth: 30.0
+  # 相对跌幅阈值(0~1): 深度跌幅需同时满足绝对阈值和相对阈值
+  # 数据类型: 浮点数 | 默认值: 0.08 | 范围: 0.02~0.8
+  # 车辆距离较远时相对跌幅不明显，阈值需降低
+  relative_drop_threshold: 0.08
+  # 有车确认帧数: 连续N帧检测到骤减才判定为有车
+  # 数据类型: 整数 | 默认值: 3 | 范围: 1~5
+  # 防止单帧深度噪声/邻车干扰导致误判，需连续3帧确认
+  car_confirm_frames: 3
+  # 无车确认帧数: 连续N帧稳定才判定为无车
+  # 数据类型: 整数 | 默认值: 5 | 范围: 1~10
+  # 确保真的稳定后才判定无车，防止短暂波动
+  stable_confirm_frames: 5
+  # 基线预热帧数: 取前N帧中位数作为初始背景深度基线
+  # 数据类型: 整数 | 默认值: 5 | 范围: 3~30
+  baseline_warmup: 5
+  # 基线EMA更新系数(0~1): 无车时基线平滑更新，越小越稳定
+  # 数据类型: 浮点数 | 默认值: 0.05 | 范围: 0.01~0.3
+  baseline_alpha: 0.05
+  # 截取帧图像格式: jpg 或 png
+  # 数据类型: 字符串 | 默认值: jpg
+  image_format: jpg
+  # JPEG保存质量(1-100): 仅 image_format=jpg 时生效
+  # 数据类型: 整数 | 默认值: 95
+  jpeg_quality: 95
+  # 是否保存可视化对比图(原图+深度图+状态标注)
+  # 数据类型: 布尔值 | 默认值: true
+  save_visualization: true
+
+  # ===== MOG2 运动检测配置 =====
+  # 基于 MOG2 背景减除，检测运动目标是否经过检测线（与深度检测配合使用）
+  # 融合逻辑(v4): 深度检测到car→直接有车 | 深度unknown+MOG2确认+深度变化验证→有车 | 深度no_car→不受MOG2影响
+  mog2:
+    # 是否启用 MOG2 运动检测
+    # 数据类型: 布尔值 | 默认值: true
+    enabled: true
+    # 检测带宽度(像素): 以检测线为中心的垂直窄带宽度（适当加宽减少噪声干扰）
+    # 数据类型: 整数 | 默认值: 30 | 范围: 10~100
+    strip_width: 30
+    # 最小运动像素数: 检测带内前景像素超过此值才判定有运动目标（基础值，会被亮度权重动态调整）
+    # 数据类型: 整数 | 默认值: 20 | 范围: 10~500
+    # 降低到20提高远距离车辆的检测灵敏度
+    min_motion_pixels: 20
+    # MOG2 历史帧数: 背景模型的历史长度
+    # 数据类型: 整数 | 默认值: 300 | 范围: 50~1000
+    history: 300
+    # MOG2 方差阈值: 像素与背景模型的方差阈值
+    # 数据类型: 整数 | 默认值: 25 | 范围: 5~100
+    var_threshold: 25
+    # 是否检测阴影 (true=检测阴影但可能误判, false=不检测阴影更稳定)
+    # 数据类型: 布尔值 | 默认值: false
+    detect_shadow: false
+    # 预热帧数: 前 N 帧不检测（背景模型未稳定，夜间场景建议增大）
+    # 数据类型: 整数 | 默认值: 30 | 范围: 10~100
+    warmup_frames: 30
+    # 确认帧数: 连续 N 帧检测到运动才确认有运动目标（防止单帧噪声，基础值，会被亮度权重动态调整）
+    # 数据类型: 整数 | 默认值: 3 | 范围: 1~10
+    confirm_frames: 3
+
+    # ===== 动态亮度权重配置 =====
+    # 根据环境亮度自动调整 MOG2 判定灵敏度：
+    # 夜间(低亮度)→深度模型不可靠→MOG2权重高→更敏感
+    # 白天(高亮度)→深度模型可靠→MOG2权重低→更严格
+    brightness:
+      # 高亮度阈值(0-255): 高于此值为白天
+      # 数据类型: 浮点数 | 默认值: 180.0 | 范围: 120~255
+      bright_high: 180.0
+      # 中亮度阈值(0-255): 低于此值为夜间
+      # 数据类型: 浮点数 | 默认值: 80.0 | 范围: 30~150
+      bright_mid: 80.0
+      # 白天 MOG2 最小权重(0~1): 权重越低越严格
+      # 数据类型: 浮点数 | 默认值: 0.4 | 范围: 0.2~0.6
+      min_weight: 0.4
+      # 夜间 MOG2 最大权重(0~1): 权重越高越敏感
+      # 数据类型: 浮点数 | 默认值: 1.0 | 范围: 0.7~1.0
+      max_weight: 1.0
+      # 权重 EMA 平滑系数(0~1): 值越小过渡越平滑
+      # 数据类型: 浮点数 | 默认值: 0.05 | 范围: 0.01~0.2
+      weight_alpha: 0.05
+      # 日志记录间隔(帧数): 每N帧记录一次亮度和权重
+      # 数据类型: 整数 | 默认值: 50 | 范围: 10~500
+      log_interval: 50
+
+# ===== 深度学习分类器配置 (detect/training/train_classifier.py) =====
+classifier:
+  # 数据集目录（必须包含 car/ 和 no_car/ 子文件夹）
+  # 数据类型: 字符串 | 默认值: detect/training/dataset
+  data_dir: detect/training/dataset
+  # 模型输出目录
+  # 数据类型: 字符串 | 默认值: checkpoints/classifier
+  output_dir: checkpoints/classifier
+
+  # ===== 数据集配置 =====
+  # 图像尺寸 (必须能被14整除)
+  # 数据类型: 整数 | 默认值: 224 | 范围: 128~512
+  img_size: 224
+  # 训练集比例
+  # 数据类型: 浮点数 | 默认值: 0.8 | 范围: 0.5~0.95
+  train_ratio: 0.8
+  # 验证集比例
+  # 数据类型: 浮点数 | 默认值: 0.1 | 范围: 0.05~0.3
+  val_ratio: 0.1
+  # 测试集比例 = 1 - train_ratio - val_ratio
+  # 随机种子（保证可复现）
+  # 数据类型: 整数 | 默认值: 42
+  random_seed: 42
+
+  # ===== 模型配置 =====
+  # 模型架构: efficientnet_b0 / resnet18 / resnet50 / mobilenet_v3_small / vit_b_16
+  # 数据类型: 字符串 | 默认值: efficientnet_b0
+  model_name: efficientnet_b0
+  # 使用预训练权重
+  # 数据类型: 布尔值 | 默认值: true
+  pretrained: true
+  # 冻结骨干网络（仅训练分类头）
+  # 数据类型: 布尔值 | 默认值: false
+  freeze_backbone: false
+  # Dropout比率
+  # 数据类型: 浮点数 | 默认值: 0.5 | 范围: 0.1~0.9
+  dropout_rate: 0.5
+
+  # ===== 训练配置 =====
+  # 训练轮数
+  # 数据类型: 整数 | 默认值: 50 | 范围: 5~500
+  epochs: 50
+  # 批处理大小 (根据显存调整)
+  # 数据类型: 整数 | 默认值: 32 | 范围: 1~128
+  batch_size: 32
+  # 学习率
+  # 数据类型: 浮点数 | 默认值: 0.001 | 范围: 0.0001~0.01
+  learning_rate: 0.001
+  # 权重衰减
+  # 数据类型: 浮点数 | 默认值: 0.0001 | 范围: 0~0.01
+  weight_decay: 0.0001
+  # 优化器: adamw / adam / sgd
+  # 数据类型: 字符串 | 默认值: adamw
+  optimizer_name: adamw
+  # 学习率调度器: cosine / step / reduce
+  # 数据类型: 字符串 | 默认值: cosine
+  scheduler_name: cosine
+
+  # ===== 数据增强配置 =====
+  # 启用数据增强
+  # 数据类型: 布尔值 | 默认值: true
+  augmentation: true
+  # 水平翻转概率
+  # 数据类型: 浮点数 | 默认值: 0.5 | 范围: 0~1
+  hflip_prob: 0.5
+  # 垂直翻转概率
+  # 数据类型: 浮点数 | 默认值: 0.1 | 范围: 0~1
+  vflip_prob: 0.1
+  # 旋转角度范围(度)
+  # 数据类型: 浮点数 | 默认值: 15 | 范围: 0~45
+  rotation_deg: 15
+  # 亮度调整因子
+  # 数据类型: 浮点数 | 默认值: 0.2 | 范围: 0~0.5
+  brightness_factor: 0.2
+  # 对比度调整因子
+  # 数据类型: 浮点数 | 默认值: 0.2 | 范围: 0~0.5
+  contrast_factor: 0.2
+
+  # ===== 早停配置 =====
+  # 启用早停
+  # 数据类型: 布尔值 | 默认值: true
+  early_stopping: true
+  # 耐心值（多少轮无改善后停止）
+  # 数据类型: 整数 | 默认值: 10 | 范围: 3~30
+  patience: 10
+  # 最小改善幅度
+  # 数据类型: 浮点数 | 默认值: 0.001 | 范围: 0~0.1
+  min_delta: 0.001
+
+  # ===== 保存配置 =====
+  # 检查点保存间隔(epoch)
+  # 数据类型: 整数 | 默认值: 5 | 范围: 1~20
+  save_interval: 5
+
+  # ===== 类别配置 =====
+  # 类别名称（按顺序对应文件夹）
+  # 数据类型: 列表 | 默认值: [no_car, car]
+  class_names:
+    - no_car
+    - car
+  # 类别到索引的映射
+  # 数据类型: 字典
+  class_to_idx:
+    no_car: 0
+    car: 1
