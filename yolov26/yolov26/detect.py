@@ -182,17 +182,17 @@ def main():
     parser = argparse.ArgumentParser(description='YOLOv26 检测与验证脚本')
     
     parser.add_argument(
-        '--model', type=str, default='/home/fst/zzy work/yolov26/detect/best.pt',
+        '--model', type=str, default=os.path.join(os.path.dirname(os.path.abspath(__file__)), 'detect/best.pt'),
         help='模型路径，支持预训练模型名称或本地权重文件路径'
     )
     
     parser.add_argument(
-        '--data', type=str, default='/home/fst/zzy work/yolov26/data.yaml',
+        '--data', type=str, default=os.path.join(os.path.dirname(os.path.abspath(__file__)), 'data.yaml'),
         help='数据集配置文件路径（用于模型验证）'
     )
     
     parser.add_argument(
-        '--source', type=str, default='/home/fst/zzy work/img_raw',
+        '--source', type=str, default=os.path.join(os.path.dirname(os.path.abspath(__file__)), 'img_raw'),
         help='检测源：图像路径、图像目录、视频路径或摄像头ID（数字）'
     )
     
@@ -202,7 +202,7 @@ def main():
     )
     
     parser.add_argument(
-        '--output', type=str, default='/home/fst/zzy work/yolov26/runs/detect',
+        '--output', type=str, default=os.path.join(os.path.dirname(os.path.abspath(__file__)), 'runs/detect'),
         help='检测结果输出目录'
     )
     
@@ -218,7 +218,7 @@ def main():
     
     args = parser.parse_args()
     
-    PROJECT_ROOT = "/home/fst/zzy work/yolov26"
+    PROJECT_ROOT = os.path.dirname(os.path.abspath(__file__))
     
     create_directories(args.output)
     os.makedirs(args.txt_dir, exist_ok=True)
@@ -251,7 +251,7 @@ def main():
         if args.source is None:
             print("错误: 检测模式需要指定 --source 参数")
             print("使用示例:")
-            print("  python detect.py --source /home/fst/zzy work/yolov26/dataset/images/val/")
+            print("  python detect.py --source dataset/images/val/")
             print("  python detect.py --source ./test_video.mp4")
             print("  python detect.py --source 0")
             sys.exit(1)

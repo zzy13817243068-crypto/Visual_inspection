@@ -48,8 +48,8 @@ def process_video(model, processor, video_path, output_dir, device,
     effective_fps = fps / frame_step
 
     video_name = Path(video_path).stem
-    # 每个视频一个子目录
-    video_out_dir = os.path.join(output_dir, video_name)
+    # 所有视频的帧平铺到一个目录，文件名里带 video_name 区分
+    video_out_dir = output_dir
     os.makedirs(video_out_dir, exist_ok=True)
 
     # 初始化深度检测器
@@ -197,9 +197,9 @@ def process_video(model, processor, video_path, output_dir, device,
     pbar.close()
     cap.release()
 
-    # 保存亮度/权重日志
+    # 保存亮度/权重日志（文件名带 video_name，平铺目录下能区分）
     if brightness_monitor and brightness_monitor.get_logs():
-        bright_log_path = os.path.join(video_out_dir, "brightness_log.json")
+        bright_log_path = os.path.join(video_out_dir, f"{video_name}_brightness_log.json")
         with open(bright_log_path, "w", encoding="utf-8") as f:
             json.dump({
                 "video": str(video_path),
@@ -221,6 +221,32 @@ def process_video(model, processor, video_path, output_dir, device,
         "no_car_saved": no_car_saved,
         "output_dir": video_out_dir,
     }
+
+
+def is_night_video(video_path, threshold=80.0, sample_frame_idx=None):
+    """判断视频是否为夜间（取中间帧计算平均亮度）。
+
+    Args:
+        video_path: 视频路径
+        threshold: 亮度阈值，低于此值为夜间
+        sample_frame_idx: 指定采样帧索引，None 则取中间帧
+    Returns:
+        (bool, float): (是否夜间, 平均亮度值)
+    """
+    cap = cv2.VideoCapture(video_path)
+    if not cap.isOpened():
+        return False, -1.0
+    total = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+    if sample_frame_idx is None:
+        sample_frame_idx = max(0, total // 2)  # 取中间帧，避开开头黑场
+    cap.set(cv2.CAP_PROP_POS_FRAMES, sample_frame_idx)
+    ret, frame = cap.read()
+    cap.release()
+    if not ret:
+        return False, -1.0
+    gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+    brightness = float(gray.mean())
+    return brightness < threshold, brightness
 
 
 def main():
@@ -251,6 +277,10 @@ def main():
                         default=str(detect_cfg.get("pixel_depth_points", "") or ""))
     parser.add_argument("--pixel-depth-count", type=int,
                         default=int(detect_cfg.get("pixel_depth_count", 5)))
+    parser.add_argument("--night-only", action="store_true",
+                        help="只处理夜间视频（平均亮度低于阈值）")
+    parser.add_argument("--night-threshold", type=float, default=80.0,
+                        help="夜间亮度阈值（0-255，低于此值为夜间，默认80）")
     args = parser.parse_args()
 
     device = torch.device(args.device if torch.cuda.is_available() else "cpu")
@@ -285,6 +315,21 @@ def main():
     if not files:
         print(f"[ERROR] 未找到视频文件: {args.source}")
         sys.exit(1)
+
+    # 夜间筛选（--night-only 时只保留平均亮度低于阈值的视频）
+    if args.night_only:
+        total_before = len(files)
+        print(f"[Night] 筛选夜间视频（阈值={args.night_threshold}）...")
+        night_files = []
+        for vp in tqdm(files, desc="夜间筛查", ncols=100):
+            is_night, bright = is_night_video(vp, args.night_threshold)
+            if is_night:
+                night_files.append(vp)
+        files = night_files
+        print(f"[Night] 夜间视频: {len(files)}/{total_before} 个")
+        if not files:
+            print(f"[ERROR] 未找到夜间视频，请降低 --night-threshold")
+            sys.exit(1)
 
     # 随机选取
     if args.seed is not None:

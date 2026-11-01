@@ -144,7 +144,8 @@ def process_video(model, processor, video_path, output_dir, device,
     effective_fps = fps / frame_step
 
     video_name = Path(video_path).stem
-    video_out_dir = os.path.join(output_dir, video_name)
+    # 所有视频的帧平铺到一个目录，文件名里带 video_name 区分
+    video_out_dir = output_dir
     os.makedirs(video_out_dir, exist_ok=True)
 
     # 初始化深度检测器
@@ -280,9 +281,9 @@ def process_video(model, processor, video_path, output_dir, device,
     pbar.close()
     cap.release()
 
-    # 保存亮度/权重日志
+    # 保存亮度/权重日志（文件名带 video_name，平铺目录下能区分）
     if brightness_monitor and brightness_monitor.get_logs():
-        bright_log_path = os.path.join(video_out_dir, "brightness_log.json")
+        bright_log_path = os.path.join(video_out_dir, f"{video_name}_brightness_log.json")
         with open(bright_log_path, "w", encoding="utf-8") as f:
             json.dump({
                 "video": str(video_path),

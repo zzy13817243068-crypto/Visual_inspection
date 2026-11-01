@@ -637,7 +637,7 @@ class MemoryManager:
 
 def main():
     """主函数"""
-    PROJECT_ROOT = "/home/fst/zzy work/yolov26"
+    PROJECT_ROOT = os.path.dirname(os.path.abspath(__file__))
     
     manager = MemoryManager(PROJECT_ROOT)
     

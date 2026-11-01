@@ -1,9 +1,8 @@
 """
-Step 3: 模型评估脚本（Depth Anything V2 - 度量深度）
-功能：
-  1. 加载微调后的 DA2-Metric 模型
-  2. 在测试图片上推理（输出真实米数）
-  3. 与预训练模型对比，输出米数统计
+Step 3: 模型评估脚本（Depth Anything V2 度量深度）。
+
+流程就三步：加载微调后的 DA2-Metric 模型；在测试图片上推理，输出真实米数；
+再跟预训练模型对比，输出米数统计。
 
 用法：
   python evaluate.py --checkpoint checkpoints/my_model/best_model.pt --image-dir datasets/my_dataset/images --output-dir eval_results --compare
@@ -185,7 +184,7 @@ def main():
         print("[ERROR] 未找到测试图片")
         sys.exit(1)
 
-    # === 评估微调模型 ===
+    # 评估微调模型
     ft_depths = None
     if args.checkpoint:
         print(f"\n{'=' * 60}")
@@ -203,7 +202,7 @@ def main():
         print(f"\n微调模型深度图已保存到: {ft_dir}")
         print_depth_stats(ft_depths, "微调模型")
 
-    # === 对比评估 ===
+    # 和预训练模型对比
     base_depths = None
     if args.compare or not args.checkpoint:
         print(f"\n{'=' * 60}")
@@ -221,7 +220,7 @@ def main():
         print(f"\n预训练模型深度图已保存到: {base_dir}")
         print_depth_stats(base_depths, "预训练模型")
 
-    # === 对比统计（米数）===
+    # 对比统计（米数）
     if ft_depths is not None and base_depths is not None:
         print(f"\n{'=' * 60}")
         print("深度预测对比统计 (单位: 米)")
@@ -237,7 +236,7 @@ def main():
             diff = abs(b_mean - f_mean)
             print(f"{name:<20} {b_mean:<16.3f} {f_mean:<16.3f} {diff:<10.3f}")
 
-    # === 与训练标签对比（从 depths/ 目录读取逐张 .npy）===
+    # 与训练标签对比，逐张读 depths/ 目录里的 .npy
     # data_dir / label_list_path 已在上方定义
     label_dir = os.path.join(data_dir, "depths")
     if os.path.exists(label_dir) and os.path.exists(label_list_path) and ft_depths is not None:

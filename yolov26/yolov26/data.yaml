@@ -6,10 +6,11 @@
 
 
 # ==================== 数据集路径配置 ====================
-# 使用绝对路径（Linux服务器路径）
-train: "/home/fst/zzy work/yolov26/dataset/images/train"     # 训练集图像目录路径
-val: "/home/fst/zzy work/yolov26/dataset/images/val"         # 验证集图像目录路径
-test: "/home/fst/zzy work/yolov26/dataset/images/test"       # 测试集图像目录路径（可选）
+# 使用相对路径（基于项目根目录）
+path: .                        # 数据集根目录（相对于本 yaml 文件所在位置）
+train: "dataset/images/train"  # 训练集图像目录路径
+val: "dataset/images/val"      # 验证集图像目录路径
+test: "dataset/images/test"    # 测试集图像目录路径（可选）
 
 
 # ==================== 类别配置 ====================

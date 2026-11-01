@@ -8,8 +8,8 @@
 # ==================== 基础配置 ====================
 task: detect              # 任务类型: detect(检测) / segment(分割) / classify(分类) / pose(姿态)
 mode: train               # 运行模式: train(训练) / val(验证) / predict(预测) / export(导出)
-model: "/home/fst/zzy work/yolov26/yolo26s.pt"         # 预训练模型路径（绝对路径，路径含空格需用引号）
-data: "/home/fst/zzy work/yolov26/data.yaml"             # 数据集配置文件路径（绝对路径，路径含空格需用引号）
+model: "yolo26s.pt"          # 预训练模型路径（相对路径）
+data: "data.yaml"            # 数据集配置文件路径（相对路径）
 
 
 # ==================== 训练超参数 ====================
@@ -31,7 +31,7 @@ workers: 4                # 数据加载线程数，用于并行加载数据
 
 
 # ==================== 输出配置 ====================
-project: "/home/fst/zzy work/yolov26/output"         # 项目根目录，用于保存训练结果（绝对路径）
+project: "output"           # 项目根目录，用于保存训练结果（相对路径）
 name: exp-det             # 实验名称，训练结果将保存在 project/name 目录下
 exist_ok: false          # 是否允许覆盖已存在的同名实验目录（false=每次生成新目录如exp-det2, exp-det3）
 

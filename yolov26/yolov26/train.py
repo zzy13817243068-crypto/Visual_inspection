@@ -50,10 +50,11 @@ def setup_safe_project_path(project_dir):
     为含空格路径创建符号链接，解决 TensorBoard 写入失败问题
     返回无空格的安全路径
     """
-    if ' ' not in project_dir:
+    if os.name == 'nt' or ' ' not in project_dir:
+        # Windows 下符号链接需要管理员权限，且 TensorBoard 在 Windows 上可正常处理空格路径
         return project_dir
     
-    safe_dir = "/home/fst/yolov26_safe_output"
+    safe_dir = os.path.join(os.environ.get('TEMP', os.path.expanduser('~')), 'yolov26_safe_output')
     
     # 如果符号链接已存在且指向正确，直接返回
     if os.path.islink(safe_dir):
@@ -261,8 +262,8 @@ def validate_model(model_path, data_path):
     results = model.val(data=data_path)
     
     print("\n验证结果:")
-    print(f"mAP@0.5: {results.box.map:.4f}")
-    print(f"mAP@0.5:0.95: {results.box.map50_95:.4f}")
+    print(f"mAP@0.5: {results.box.map50:.4f}")
+    print(f"mAP@0.5:0.95: {results.box.map:.4f}")
     
     return results
 
@@ -270,7 +271,7 @@ def validate_model(model_path, data_path):
 def main():
     """主函数: 执行完整的训练流程"""
     
-    PROJECT_ROOT = "/home/fst/zzy work/yolov26"
+    PROJECT_ROOT = os.path.dirname(os.path.abspath(__file__))
     print(f"项目根目录: {PROJECT_ROOT}")
     
     config_path = os.path.join(PROJECT_ROOT, 'args.yaml')
@@ -296,19 +297,19 @@ def main():
     print(f"\n加载模型: {model_name}")
     print(f"模型参数量: {sum(p.numel() for p in model.parameters()) / 1e6:.2f} M")
     
-    # 确保输出目录存在
+    # 确保输出目录存在（相对路径基于项目根目录解析为绝对路径）
     project_dir = cfg.get('project', os.path.join(PROJECT_ROOT, 'output'))
+    if not os.path.isabs(project_dir):
+        project_dir = os.path.join(PROJECT_ROOT, project_dir)
     os.makedirs(project_dir, exist_ok=True)
-    
-    # 为含空格路径创建符号链接，解决 TensorBoard 写入问题
+
+    # 为含空格路径创建符号链接，解决 TensorBoard 写入问题（Windows 下直接返回原路径）
     safe_project = setup_safe_project_path(project_dir)
-    
-    # 开始训练，使用无空格路径确保 TensorBoard 正常工作
     if safe_project != project_dir:
         print(f"使用安全路径进行训练: {safe_project}")
-        train_results = model.train(cfg=config_path, project=safe_project)
-    else:
-        train_results = model.train(cfg=config_path)
+
+    # 开始训练，显式传入绝对路径，避免 Ultralytics 将相对路径拼到 runs/detect 下
+    train_results = model.train(cfg=config_path, project=safe_project)
     
     # 验证 TensorBoard event 文件
     if train_results:

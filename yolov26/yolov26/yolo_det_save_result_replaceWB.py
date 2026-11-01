@@ -319,7 +319,7 @@ if __name__ == "__main__":
     save_result = False
     save_txt = False
     resave_source_img = True
-    max_per_folder = 5000
+    max_per_folder = 20000
     frame_interval = 1
 
     # 路径配置（基于脚本所在目录的相对路径，跨平台兼容）
@@ -327,7 +327,23 @@ if __name__ == "__main__":
     input_path = str(BASE_DIR / 'yolo_det_save_result_replaceWB')
     output_img_dir = str(BASE_DIR / 'result')
     output_label_dir = str(BASE_DIR / 'datasets' / '2026-2027-replace_WB' / 'labels')
-    model_path = str(BASE_DIR / 'output' / 'exp-det-12' / 'weights' / 'best.pt')
+    # 自动选择最新模型：扫描 output 目录下所有 exp-det* 子目录，选编号最大的 best.pt
+    output_root = BASE_DIR / 'output'
+    candidates = []
+    if output_root.exists():
+        for d in output_root.iterdir():
+            if d.is_dir() and d.name.startswith('exp-det'):
+                best = d / 'weights' / 'best.pt'
+                if best.exists():
+                    # 提取编号：exp-det -> 1, exp-det-14 -> 14
+                    suffix = d.name[len('exp-det'):]
+                    num = int(suffix.lstrip('-')) if suffix.lstrip('-').isdigit() else 0
+                    candidates.append((num, str(best)))
+    if not candidates:
+        model_path = str(BASE_DIR / 'output' / 'exp-det-12' / 'weights' / 'best.pt')
+    else:
+        candidates.sort(key=lambda x: x[0], reverse=True)
+        model_path = candidates[0][1]
 
     # 初始化
     img_count = 0

@@ -6,7 +6,7 @@
 """
 import os
 
-PROJECT_ROOT = "/home/fst/zzy work/yolov26"
+PROJECT_ROOT = os.path.dirname(os.path.abspath(__file__))
 
 directories = [
     os.path.join(PROJECT_ROOT, 'pretrained_models'),

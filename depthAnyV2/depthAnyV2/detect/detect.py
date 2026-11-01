@@ -1,13 +1,13 @@
 """
-模型验证与推理脚本（Depth Anything V2 - 度量深度，输出真实米数）
-支持图片、视频、目录输入
+DA2 度量深度的验证/推理脚本，出来的就是真实米数。
+图片、视频、整个目录都能丢进来。
 
-用法：
+跑法：
   python detect.py --source input/ --model-depth chqeckpoints/my_model/best_model.pt
 
-输出：
-  - 单图：原图+深度对比图、深度彩色图、深度 .npy（米数）
-  - 视频：左右对比视频、深度 .npz
+出来后：
+  - 单图：原图+深度的对比图、深度彩色图，还有米数的 .npy
+  - 视频：左右对比视频 + 深度 .npz
 """
 
 import os
@@ -123,23 +123,177 @@ def annotate_depth(vis, d_min, d_max, img_h, pixel_points=None, pixel_depths=Non
     return vis
 
 
-# ============================================================
-# 车辆检测器：核心判定逻辑（与 detect_car.py 同步）
-# ============================================================
-# 全局 YOLO 模型缓存：多视频/多 detector 实例共享同一权重，避免每个视频都懒加载打印打断 tqdm
+# 车辆检测器：核心判定逻辑，跟 detect_car.py 保持一致。
+# 全局 YOLO 模型缓存：多个视频/多个 detector 共用同一份权重，
+# 不然每个视频都要懒加载一次、打印还会打断 tqdm。
+# 背景图片/视频扩展名
+_BG_IMAGE_EXTS = (".jpg", ".jpeg", ".png", ".bmp", ".webp")
+_BG_VIDEO_EXTS = (".mp4", ".avi", ".mov", ".mkv", ".flv", ".wmv", ".asf")
+
+
+def load_baseline_depths(baseline_dir, model, processor, device, pixel_points, max_frames=30):
+    """
+    把背景目录里的图片和视频都翻一遍，抽监测点的深度，用来预设基线。
+    baseline_dir 是背景目录；model/processor 是 DA2 深度模型；device 是算的设备；
+    pixel_points 是监测点 [(x,y), ...]；max_frames 是每个背景视频最多抽几帧（图片不限）。
+    返回每帧背景的 pixel_depths 列表。
+    """
+    if not baseline_dir or not os.path.isdir(baseline_dir):
+        return []
+    image_files = []
+    video_files = []
+    for dp, _, files in os.walk(baseline_dir):
+        for f in sorted(files):
+            ext = os.path.splitext(f)[1].lower()
+            full = os.path.join(dp, f)
+            if ext in _BG_IMAGE_EXTS:
+                image_files.append(full)
+            elif ext in _BG_VIDEO_EXTS:
+                video_files.append(full)
+    if not image_files and not video_files:
+        print(f"[Baseline] 背景目录无图片/视频: {baseline_dir}")
+        return []
+
+    depths_list = []
+
+    # 图片：每张跑一次深度
+    for ip in image_files:
+        img = cv2.imread(ip)
+        if img is None:
+            continue
+        depths = _infer_pixel_depths(model, processor, img, device, pixel_points)
+        if depths is not None:
+            depths_list.append(depths)
+
+    # 视频：等间隔抽帧
+    for vp in video_files:
+        cap = cv2.VideoCapture(vp)
+        if not cap.isOpened():
+            continue
+        total = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+        if total <= 0:
+            cap.release()
+            continue
+        step = max(1, total // max_frames)
+        frame_idx = 0
+        got = 0
+        while got < max_frames and frame_idx < total:
+            cap.set(cv2.CAP_PROP_POS_FRAMES, frame_idx)
+            ok, frame = cap.read()
+            if not ok or frame is None:
+                break
+            depths = _infer_pixel_depths(model, processor, frame, device, pixel_points)
+            if depths is not None:
+                depths_list.append(depths)
+                got += 1
+            frame_idx += step
+        cap.release()
+
+    print(f"[Baseline] 从 {len(image_files)} 张图片 + {len(video_files)} 个视频 "
+          f"提取 {len(depths_list)} 帧背景深度")
+    return depths_list
+
+
+def apply_clahe(frame_bgr, clip_limit=2.0, tile_grid_size=(8, 8)):
+    """夜里去眩光、提亮暗部：到 Lab 空间只对 L 通道做 CLAHE。
+    返回增强后的 BGR 帧。深度模型和 YOLO 得吃同一张增强帧，判定口径才对得上。
+    """
+    lab = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2LAB)
+    l, a, b = cv2.split(lab)
+    clahe = cv2.createCLAHE(clipLimit=float(clip_limit), tileGridSize=tile_grid_size)
+    l = clahe.apply(l)
+    return cv2.cvtColor(cv2.merge((l, a, b)), cv2.COLOR_LAB2BGR)
+
+
+def _frame_mean_brightness(frame_bgr, target_w=160.0, target_h=90.0, independent_scale=False):
+    """先把帧降采样再算平均灰度(0~255)，这样快。
+
+    - independent_scale=False：x/y 用同一个缩放系数（VehicleDetector 夜间判定的老做法）
+    - independent_scale=True：x/y 各自缩放（BrightnessMonitor 的老做法，用 sample_width/height）
+    这两处调用都跟重构前的数值结果一模一样，没差。
+    """
+    h, w = frame_bgr.shape[:2]
+    if independent_scale:
+        sx = min(1.0, target_w / w)
+        sy = min(1.0, target_h / h)
+        need_resize = (sx < 1.0 or sy < 1.0)
+        fx, fy = sx, sy
+    else:
+        scale = min(1.0, target_w / w, target_h / h)
+        need_resize = scale < 1.0
+        fx = fy = scale
+    if need_resize:
+        small = cv2.resize(frame_bgr, None, fx=fx, fy=fy, interpolation=cv2.INTER_AREA)
+    else:
+        small = frame_bgr
+    gray = cv2.cvtColor(small, cv2.COLOR_BGR2GRAY)
+    return float(np.mean(gray))
+
+
+def _infer_depth_map(model, processor, frame_bgr, device):
+    """单帧跑一次深度推理，返回 (depth_np, frame_time_ms)。
+    跟以前各流水线里内联的那段推断块语义一样（连计时都算），出异常照样往上抛。"""
+    h, w = frame_bgr.shape[:2]
+    img_rgb = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
+    inputs = processor(images=[img_rgb], return_tensors="pt").to(device)
+    t0 = time.time()
+    with torch.no_grad():
+        outputs = model(**inputs)
+        depth = outputs.predicted_depth
+    frame_time = (time.time() - t0) * 1000  # 毫秒
+    # 统一成 4D 再插值
+    if depth.dim() == 3:
+        depth = depth.unsqueeze(1)
+    depth = torch.nn.functional.interpolate(
+        depth, size=(h, w), mode="bicubic", align_corners=False
+    ).squeeze().cpu().numpy()
+    return depth, frame_time
+
+
+def _extract_pixel_depths(depth, pixel_points, frame_bgr=None, sat_threshold=0):
+    """从深度图里把监测点的深度抠出来。点越界就返回 nan。
+    - frame_bgr / sat_threshold 是车灯过曝点的屏蔽（P0-2）：某个像素最大通道 ≥ sat_threshold 就当过曝，
+      这块深度不可信 → 返回 nan。sat_threshold<=0 就不屏蔽（跟原来一样）。
+    """
+    h, w = depth.shape[:2]
+    out = []
+    for px, py in pixel_points:
+        if 0 <= px < w and 0 <= py < h:
+            if sat_threshold > 0 and frame_bgr is not None:
+                b = int(frame_bgr[py, px, 0])
+                g = int(frame_bgr[py, px, 1])
+                r = int(frame_bgr[py, px, 2])
+                if max(b, g, r) >= sat_threshold:
+                    out.append(float("nan"))
+                    continue
+            out.append(float(depth[py, px]))
+        else:
+            out.append(float("nan"))
+    return out
+
+
+def _infer_pixel_depths(model, processor, frame_bgr, device, pixel_points):
+    """对单帧图像跑深度推理，返回 pixel_points 对应的深度列表；失败返回 None"""
+    try:
+        depth, _ = _infer_depth_map(model, processor, frame_bgr, device)
+        return _extract_pixel_depths(depth, pixel_points)
+    except Exception:
+        return None
+
+
 _YOLO_CACHE: dict = {}  # key=(model_path_norm, device_norm) -> yolo_model_obj
 
 class VehicleDetector:
     """
-    基于检测线多点深度变化的车辆存在判定（v8: 非对称双列 + 全点检测）。
+    靠检测线上多点深度的变化来判有没有车（v8：非对称双列 + 全点检测）。
 
-    核心改进：
-    - 支持非对称双列检测线（x=40共7个点，x=55共8个点，共15个点）
-    - 奇数点数（如15）自动走全点模式，所有点独立参与检测
-    - 偶数且≥10的点数走双列对称聚合模式
-    - 预热阶段前3帧直接加入buffer，第4帧开始用buffer中位数检测异常
-    - 异常帧（有车）不加入buffer，避免基线被污染
-    - 使用中位数而非均值建立基线，抗深度模型不稳定
+    几点关键的：
+    - 支持非对称双列检测线（x=40 摆 7 个点，x=55 摆 8 个点，一共 15 个）
+    - 点数是奇数（比如 15）就走全点模式，每个点各算各的
+    - 点数是偶数且 ≥10 就走双列对称聚合
+    - 预热时前 3 帧先塞进 buffer，第 4 帧起拿 buffer 中位数看异常
+    - 异常帧（有车）不进 buffer，免得把基线搞脏
+    - 基线用中位数不用均值，扛得住深度模型抖动
     """
 
     def __init__(self, n_points=5,
@@ -155,7 +309,7 @@ class VehicleDetector:
                  max_detect_depth=30.0,
                  relative_drop_threshold=0.15,
                  max_vehicle_depth=20.0,
-                 # ===== YOLO 视觉检测参数 =====
+                 # YOLO 视觉检测参数
                  yolo_enabled=False,
                  yolo_model_path="yolov8n.pt",
                  yolo_device="",
@@ -164,9 +318,24 @@ class VehicleDetector:
                  yolo_vehicle_classes=(1, 2, 3, 5, 7),
                  yolo_enter_bottom_ratio=0.30,
                  yolo_min_box_ratio=0.02,
-                 # ===== 多规则融合权重 (R1+R2+R3+R4+R5 = 1.00) =====
+                 yolo_detect_x=40,
+                 yolo_cross_tolerance=15,
+                 # 多规则融合权重，R1+R2+R3+R4+R5 = 1.00
                  rule_weights=None,
-                 car_confidence_threshold=0.470):
+                 car_confidence_threshold=0.470,
+                 # 夜间自适应，专门对付车头光源干扰
+                 night_bright_threshold=80.0,
+                 night_smooth_alpha=0.35,
+                 night_confirm_extra=2,
+                 night_cooldown_extra=20,
+                 # 一车一信号相关
+                 min_car_hold_frames=10,
+                 min_signal_interval_frames=15,
+                 spike_abs_threshold=8.0,
+                 car_exit_cooldown_frames=15,
+                 baseline_rescue_frames=30,
+                 baseline_up_snap_frames=10,
+                 baseline_down_snap_frames=10):
         self.n_points = n_points
         self.distance_drop_threshold = distance_drop_threshold
         self.normal_fluctuation = normal_fluctuation
@@ -204,7 +373,7 @@ class VehicleDetector:
         # 滑动窗口参数
         self.window_size = 10
 
-        # ===== 多规则权重：深度变化(70%) + 视觉(30%) =====
+        # 多规则权重：深度变化 70% + 视觉 30%
         default_weights = {
             'R1': 0.10,   # Way4 深度骤变
             'R2': 0.25,   # Way5 绝对深度分布 (主规则)
@@ -217,7 +386,7 @@ class VehicleDetector:
         # 加权置信度阈值（≥此值判定有车）
         self.car_confidence_threshold = car_confidence_threshold
 
-        # ===== YOLO 视觉检测 (延迟加载，禁用或模型不存在时静默降级) =====
+        # YOLO 视觉检测：延迟加载，禁用或者模型不在就静默降级，不崩
         self.yolo_enabled = yolo_enabled
         self.yolo_model_path = yolo_model_path
         self.yolo_device = yolo_device
@@ -226,6 +395,10 @@ class VehicleDetector:
         self.yolo_vehicle_classes = tuple(int(c) for c in yolo_vehicle_classes)
         self.yolo_enter_bottom_ratio = yolo_enter_bottom_ratio
         self.yolo_min_box_ratio = yolo_min_box_ratio
+        # 检测线 x 坐标与过线容差(px)：YOLO 框左沿必须到达 detect_x + 容差 才计入视觉分
+        # 防止车还没到检测线（只是从右侧靠近）就触发 R5 误报
+        self.yolo_detect_x = int(yolo_detect_x)
+        self.yolo_cross_tolerance = float(yolo_cross_tolerance)
         self._yolo_model = None
         self._yolo_load_error = None  # 记录加载失败原因（静默降级不崩溃）
 
@@ -241,15 +414,54 @@ class VehicleDetector:
         self.last_vision_score = 0.0  # 最近帧的 YOLO 视觉评分
         self._last_scores = {}     # 最近帧各规则分数
         self._last_yolo_boxes = []  # 最近帧的 YOLO 车辆检测框 [(x1,y1,x2,y2,conf,cls),...]
+        # 车辆离开冷却期：car→no_car 转换后，提高新 car 触发门槛
+        # 防止两车间隔阶段噪声波动误触发 car
+        self._car_exit_cooldown = 0  # 剩余冷却帧数
+        # 冷却期总帧数（默认40≈1.33s@30fps；微波替代场景建议15≈0.5s，跟车间隔短才分得开）
+        self._cooldown_frames = int(car_exit_cooldown_frames)
 
-    # ============================================================
-    # YOLO 视觉检测（延迟加载 + 静默降级 + 进入检测区域判定）
-    # ============================================================
+        # 夜间自适应状态
+        self.night_bright_threshold = float(night_bright_threshold)
+        self.night_smooth_alpha = float(night_smooth_alpha)
+        self.night_confirm_extra = int(night_confirm_extra)
+        self.night_cooldown_extra = int(night_cooldown_extra)
+        self._ema_road_depths = None   # 夜间深度 EMA 平滑缓存
+        self._is_night = False          # 当前帧是否夜间
+
+        # 一车一信号三件套：
+        # 状态锁——确认 car 后锁 min_car_hold_frames 帧，锁内不做回退判定，防"刚确认就闪退"
+        self.min_car_hold_frames = int(min_car_hold_frames)
+        self._car_hold_remaining = 0
+        # 信号层——只在非car→car上升沿发一次信号，彻底回no_car且冷却结束才解锁下一次
+        self.min_signal_interval_frames = int(min_signal_interval_frames)
+        self.signal_count = 0
+        self._signal_armed = True
+        self._last_signal_update = -10 ** 9
+        self._update_n = 0
+        # 孤立尖峰过滤——单点比上一帧跳变超过该米数且其他点没联动，就当噪声丢掉；0=关闭
+        self.spike_abs_threshold = float(spike_abs_threshold)
+        self._prev_valid_depths = None
+        # 基线救援——视频开头就有车占线、预热一直收不到无车帧导致基线建不起来时，
+        # 用"逐点历史最大深度"兜底当基线（路面=该点能看到的最远距离，遮挡只会更近）；0=关闭
+        self.baseline_rescue_frames = int(baseline_rescue_frames)
+        self._road_max = None
+        # 基线上浮校正——深度只会被遮挡压小，不可能比真实路面更远；
+        # 某点连续 N 帧高于基线就说明基线是错的（被占线车污染），抬回观测值；0=关闭
+        self.baseline_up_snap_frames = int(baseline_up_snap_frames)
+        self._above_baseline_cnt = None
+        # 基线下沉校正——噪声/漂移会让基线比真实路面偏高零点几米（8%相对下降在10m处才0.8m，
+        # 与噪声同量级），这种"亚米级假下降"会在空路面持续撑着 R1/R3 分数、把状态机锁死在 car
+        # （两车共用一个信号的根因之一）。真车遮挡是米级下降（>band）；
+        # obs 持续低于基线 (0.3, band] 米 → 基线噪声偏高，压回观测值；0=关闭
+        self.baseline_down_snap_frames = int(baseline_down_snap_frames)
+        self._below_baseline_cnt = None
+
+    # YOLO 视觉检测：延迟加载 + 静默降级 + 判定车有没有进检测区域
     def _ensure_yolo_loaded(self):
         """
-        延迟加载 YOLO 模型（首次调用时执行，失败则记录错误并永久关闭，不影响深度检测）。
-        全局缓存：同一 (model_path, device) 只真正加载一次，后续实例共享对象，避免重复加载/打印。
-        返回 True=已就绪, False=不可用（禁用/加载失败）。
+        YOLO 模型延迟加载，第一次用到才加载；失败就记下错误并永久关掉，不影响深度检测。
+        全局缓存：同一个 (model_path, device) 只真加载一次，后面实例共用，不重复加载/打印。
+        返回 True=能用，False=用不了（没开或加载失败）。
         """
         global _YOLO_CACHE
         if not self.yolo_enabled:
@@ -263,7 +475,7 @@ class VehicleDetector:
             from ultralytics import YOLO
             import torch
 
-            # 确定设备：优先使用 yolo_device 参数，否则 cuda/cpu 自动判断
+            # 定设备：优先用 yolo_device 参数，没填就 cuda/cpu 自己判断
             device = self.yolo_device
             if not device:
                 device = "cuda" if torch.cuda.is_available() else "cpu"
@@ -272,13 +484,13 @@ class VehicleDetector:
             model_path = self.yolo_model_path
             if (isinstance(model_path, str) and model_path.endswith(".pt")
                     and not os.path.isabs(model_path) and not os.path.exists(model_path)):
-                # 相对路径尝试拼接项目根目录
+                # 相对路径就试着拼项目根目录
                 candidate = os.path.join(os.getcwd(), model_path)
                 if os.path.exists(candidate):
                     model_path = candidate
-                # 否则交给 ultralytics 自动下载官方权重
+                # 找不到就交给 ultralytics 自动下官方权重
 
-            # ---- 全局缓存命中 ----
+            # 全局缓存命中
             cache_key = (os.path.normcase(os.path.abspath(model_path))
                          if isinstance(model_path, str) and os.path.isabs(model_path) else str(model_path),
                          str(device).lower())
@@ -286,7 +498,7 @@ class VehicleDetector:
                 self._yolo_model = _YOLO_CACHE[cache_key]
                 return True  # 命中时静默，不再打印
 
-            # ---- 首次加载 ----
+            # 第一次加载
             yolo = YOLO(model_path)
             # 预热一次空推断（加速首帧），但不读结果
             try:
@@ -308,19 +520,16 @@ class VehicleDetector:
 
     def yolo_detect_frame(self, frame_bgr):
         """
-        在单帧图像上运行 YOLO 车辆检测，并判定车辆是否进入检测区域。
+        单帧跑一遍 YOLO 车辆检测，看车有没有进检测区域。
 
-        视觉协同原则（非独立触发）：
-        1. 只识别配置列表中的 vehicle_classes（car/truck/bus/motorcycle/bicycle）
-        2. 只统计画面下方 enter_bottom_ratio 区域内的框（判定车已到检测线附近）
-        3. 忽略极小框 min_box_ratio（过滤远处背景车辆误检）
+        视觉只是协同，不单独触发：
+        1. 只认配置里的 vehicle_classes（car/truck/bus/motorcycle/bicycle）
+        2. 只数画面下方 enter_bottom_ratio 区域里的框（说明车已经到检测线附近）
+        3. 太小的框 min_box_ratio 直接忽略（那是远处背景车的误检）
 
-        Args:
-            frame_bgr: BGR 格式原始画面（cv2.imread/cap.read 返回格式）
-
-        Returns:
-            vision_score: float [0..1]  — YOLO 视觉检测+进入区域综合评分
-            boxes: list[(x1,y1,x2,y2,conf,cls)]  — 命中的车辆检测框
+        frame_bgr 是 BGR 原始画面（cv2.imread/cap.read 出来的格式）。
+        返回 vision_score [0..1] 是视觉+进区的综合分，
+        boxes 是命中的框 [(x1,y1,x2,y2,conf,cls)]。
         """
         self._last_yolo_boxes = []
         if frame_bgr is None:
@@ -337,7 +546,7 @@ class VehicleDetector:
         min_box_area = img_area * self.yolo_min_box_ratio * self.yolo_min_box_ratio
 
         try:
-            # YOLO 预测 (BGR 直接喂入，ultralytics 内部处理)
+            # YOLO 预测，BGR 直接喂，ultralytics 内部自己处理
             with torch.no_grad():
                 results = self._yolo_model.predict(
                     frame_bgr,
@@ -370,6 +579,11 @@ class VehicleDetector:
                     if y2 < enter_y:
                         # 框底部在检测线上方（车未到线）
                         continue
+                    # 过线过滤：车辆从画面右侧驶来，框左沿 x1 必须到达检测线
+                    # （x1 <= detect_x + 容差），车只是在右侧靠近/行驶时不计入视觉分，
+                    # 避免"车还没到检测线就报 car"。容差用于吸收检测框抖动。
+                    if x1 > self.yolo_detect_x + self.yolo_cross_tolerance:
+                        continue
                     hits.append((int(x1), int(y1), int(x2), int(y2), c, cls_id))
 
         # 计算视觉评分 (0..1)：取命中框中最高置信度，再乘进入深度惩罚
@@ -400,10 +614,10 @@ class VehicleDetector:
 
     def _column_aggregate(self, depths):
         """
-        双列聚合：将两列同高度点取min，聚合为等效单数组。
+        双列聚合：同高度两列取 min，合成一个等效的单数组。
 
-        双列模式下，depths格式为[col0_p0, col0_p1, ..., col0_p6, col1_p0, col1_p1, ..., col1_p6]
-        聚合后返回[min(p0,p0'), min(p1,p1'), ..., min(p6,p6')]
+        双列模式下 depths 是 [col0_p0...col0_p6, col1_p0...col1_p6]，
+        聚合后变成 [min(p0,p0'), min(p1,p1'), ..., min(p6,p6')]。
         """
         if not self.is_dual_col:
             return depths
@@ -413,6 +627,11 @@ class VehicleDetector:
         # 取两列中更浅的深度（车辆覆盖时深度更近）
         aggregated = np.minimum(col0, col1)
         return aggregated
+
+    @staticmethod
+    def _compute_frame_brightness(frame_bgr):
+        """降采样计算帧平均灰度(0~255)，用于夜间判定。"""
+        return _frame_mean_brightness(frame_bgr, 160.0, 90.0, independent_scale=False)
 
     def _get_road_depths(self, depths):
         """提取检测线上P2-P7的深度值（双列时已聚合）"""
@@ -434,46 +653,58 @@ class VehicleDetector:
             return np.median(buf, axis=0)
         return None
 
-    @staticmethod
-    def detect_vehicle_present(depths, valid_mask, road_zone_start,
-                                min_points=3, bounce_min=0.8, max_depth=15.0):
-        """保留兼容接口：反弹检测（已过滤异常深度点）
-
-        Args:
-            depths: 深度数组
-            valid_mask: 有效点掩码
-            road_zone_start: 检测区域起始索引
-            min_points: 最少有效点数
-            bounce_min: 反弹最小深度差
-            max_depth: 参与反弹检测的最大深度（超过此值的点视为天空/远景）
+    def preset_baseline(self, depths_list):
         """
-        n = len(depths)
-        road_indices = np.arange(road_zone_start, n)
-        road_valid = valid_mask[road_indices] & (depths[road_indices] > 0) & (depths[road_indices] <= max_depth)
-        valid_road = road_indices[road_valid]
-        if len(valid_road) < min_points:
-            return False, None
-        bounces = 0
-        for i in range(len(valid_road) - 1):
-            if valid_road[i + 1] == valid_road[i] + 1:
-                d_upper = depths[valid_road[i]]
-                d_lower = depths[valid_road[i + 1]]
-                if d_upper > 0 and d_lower > d_upper + bounce_min:
-                    bounces += 1
-        if bounces >= 1:
-            return True, valid_road
-        return False, None
+        拿外部背景图/视频的深度点当基线，这样能跳过视频预热那一步。
+
+        depths_list 每项是一帧背景的 pixel_depths（长度 = n_points，里面有 NaN 就是无效点）。
+        返回 bool，看基线设成没成。
+        """
+        if not depths_list:
+            return False
+        road_frames = []
+        for depths in depths_list:
+            road = self._get_road_depths(depths)
+            road_arr = np.asarray(road, dtype=np.float32)
+            # 用中位数过滤 NaN：每点取所有帧的中位数，NaN 不参与
+            road_frames.append(road_arr)
+        if not road_frames:
+            return False
+        buf = np.stack(road_frames, axis=0)  # (N, n_road_points)
+        # 沿帧轴取中位数，忽略 NaN
+        with np.errstate(all="ignore"):
+            baseline = np.nanmedian(buf, axis=0).astype(np.float32)
+        # 剩余 NaN 用 0 填充（无效点）
+        baseline = np.where(np.isnan(baseline), 0.0, baseline)
+        if baseline.size == 0 or np.all(baseline == 0):
+            print(f"[Baseline] 背景深度全部无效，预设失败")
+            return False
+        self.baseline = baseline
+        self.current_state = "no_car"
+        self.pending_state = "no_car"
+        self.confirm_count = 0
+        self._car_exit_cooldown = 0
+        self.warmup_buffer = []
+        # 一车一信号相关状态也一起复位
+        self._car_hold_remaining = 0
+        self.signal_count = 0
+        self._signal_armed = True
+        self._last_signal_update = -10 ** 9
+        self._prev_valid_depths = None
+        self._road_max = None
+        self._above_baseline_cnt = None
+        self._below_baseline_cnt = None
+        print(f"[Baseline] 已用 {len(depths_list)} 帧背景预设基线 "
+              f"({self.n_road_points} 点, 中位深度 {np.median(baseline[baseline>0]):.1f}m)")
+        return True
 
     def _analyze_depth_pattern(self, road_depths, valid_mask):
-        """分析深度分布模式，判断是否具有车辆特征的双峰分布
+        """看深度分布像不像有车，重点是有没有双峰。
 
-        车辆特征：深度呈双峰分布（近=路面+车辆覆盖，远=车辆顶面/远端），
-        且近/远簇之间有明确间隙（车辆高度导致）。
-        场景特征：深度呈连续渐变，无明确间隙分隔。
-
-        Returns:
-            depth_span_ok: 是否具有车辆特征的深度跨度模式
-            span_valid_depths: 有效深度值列表
+        有车：深度是双峰（近的一簇=路面+车压住，远的一簇=车顶/远端），
+        而且近远两簇中间有明显空隙（车的高度撑出来的）。
+        没车（普通场景）：深度一路渐变，没有明确的分隔。
+        返回 depth_span_ok（是不是车辆那种跨度模式）和 span_valid_depths（有效深度值）。
         """
         span_valid_depths = []
         for i in range(len(road_depths)):
@@ -557,16 +788,16 @@ class VehicleDetector:
 
     def _detect_car_by_depth(self, road_depths, valid_mask, ref_baseline=None):
         """
-        基于加权置信度的车辆检测（消除一票否决，综合多规则评分）。
+        加权置信度判车，不再一票否决，靠多条规则一起打分。
 
-        置信度规则：
-        - R1 [15%]: Way4 深度骤变 — depth_span_ok + 基线对比（双峰+下降）
-        - R2 [30%]: Way5 绝对深度 — 深背景/双峰/全覆盖 + 紧凑簇特征
-        - R3 [30%]: Way1 基线对比 — 独立基线下降（增强分布特征/比例门控）
-        - R4 [25%]: 车辆区域统计 — car_depths(5-15m)紧凑度 + shallow点 + 深背景上下文
+        四条规则：
+        - R1 [15%]：Way4 深度骤变 —— depth_span_ok 再加基线对比（双峰+下降）
+        - R2 [30%]：Way5 绝对深度 —— 深背景/双峰/全覆盖 + 簇要紧凑
+        - R3 [30%]：Way1 基线对比 —— 独立的基线下降（分布特征/比例门控兜着）
+        - R4 [25%]：车辆区域统计 —— car_depths(5-15m) 紧凑度 + shallow 点 + 深背景上下文
 
-        每条规则输出 [0..1] 置信度分数，加权求和后 ≥0.5 判定有车。
-        阈值可通过 self.car_confidence_threshold 调整。
+        每条规则出 [0..1] 的分，加权求和 ≥0.5 就算有车。
+        阈值在 self.car_confidence_threshold 上调。
         """
         if ref_baseline is None:
             ref_baseline = self._get_ref_baseline()
@@ -610,7 +841,7 @@ class VehicleDetector:
         shallow_count = len(shallow_depths)
         deep_bg_ratio = sum(1 for d in all_valid_depths if d > 20.0) / n_valid
 
-        # ==================== 提前计算基线对比（R1/R3共用） ====================
+        # 先把基线对比算出来，R1/R3 共用
         car_points_w1 = 0
         drops_w1 = []
         if ref_baseline is not None:
@@ -641,7 +872,7 @@ class VehicleDetector:
                                 max_depth <= 20.0 and
                                 (has_some_drop or depth_range > 1.0))
 
-        # ==================== R1: Way4 深度骤变 ====================
+        # R1: Way4 深度骤变
         r1_score = 0.0
         if depth_span_ok and ref_baseline is not None and car_points_w1 > 0:
             if drops_w1:
@@ -654,7 +885,7 @@ class VehicleDetector:
             mag_score = min(1.0, mean_drop_w1 / 8.0)
             r1_score = (ratio_score + mag_score) / 2.0 * 0.7
 
-        # ==================== R2: Way5 绝对深度 ====================
+        # R2: Way5 绝对深度
         r2_score = 0.0
         if absolute_car_points >= self.min_car_points and car_depths:
             # 路径1: 有深背景（部分覆盖货车经典场景）
@@ -689,7 +920,7 @@ class VehicleDetector:
                     context_bonus = max(0.0, min(0.4, car_ratio * 0.6))
                     r2_score = min(1.0, r2_score + context_bonus)
 
-        # ==================== R3: Way1 基线对比 ====================
+        # R3: Way1 基线对比
         r3_score = 0.0
         if ref_baseline is not None and car_points_w1 >= self.min_car_points:
             # Way1 增强检查（多条件互补，防邻近车辆误检）
@@ -706,7 +937,7 @@ class VehicleDetector:
                 mag_score_r3 = min(1.0, mean_drop_w1 / 5.0)
                 r3_score = max(ratio_score_r3, mag_score_r3)
 
-        # ==================== R4: 车辆区域统计特征 ====================
+        # R4: 车辆区域统计特征
         r4_score = 0.0
 
         # 4a: car_depths(5-15m) 紧凑度评分
@@ -747,20 +978,20 @@ class VehicleDetector:
         # R4 = 取各子项最大值（多路径互补）
         r4_score = max(car_compact, r4b_shallow, r4c_context, r4d_all)
 
-        # ==================== 加权求和（深度变化+视觉协同，自适应模式） ====================
-        # 两种模式：
-        # A. 纯深度模式（YOLO禁用 或 R5=0 无视觉信号）→ 硬编码老权重 R1=0.15/R2=0.30/R3=0.30/R4=0.25
-        #    → 保持老 25 用例判定边界（100% 兼容）
-        # B. 视觉协同模式（YOLO启用 且 R5>0）→ 用配置权重 R1~R5，默认深度变化70%+视觉30%
+        # 加权求和：深度变化 + 视觉协同，自适应切换
+        # 分两种模式：
+        # A. 纯深度（YOLO 禁用或 R5=0 没视觉信号）→ 用写死的老权重 R1=0.15/R2=0.30/R3=0.30/R4=0.25，
+        #    这样老的 25 个用例判定边界一点不变（100% 兼容）
+        # B. 视觉协同（YOLO 启用且 R5>0）→ 用配置里的 R1~R5，默认深度变化 70% + 视觉 30%
         weights = self.rule_weights
         r5_score = float(getattr(self, 'last_vision_score', 0.0))
         yolo_active = bool(getattr(self, 'yolo_enabled', False))
 
         if (not yolo_active) or r5_score <= 1e-9:
-            # ----- 模式 A：纯深度，100% 兼容老判定 -----
+            # 模式 A：纯深度，跟老判定 100% 一样
             w1, w2, w3, w4, w5_used = 0.15, 0.30, 0.30, 0.25, 0.0
         else:
-            # ----- 模式 B：深度 + 视觉协同 -----
+            # 模式 B：深度 + 视觉协同
             w1 = float(weights.get('R1', 0.10))
             w2 = float(weights.get('R2', 0.25))
             w3 = float(weights.get('R3', 0.25))
@@ -773,7 +1004,7 @@ class VehicleDetector:
                       r4_score * w4 +
                       r5_score * w5_used)
 
-        # ==================== 已确认 CAR 状态下的 YOLO 视觉高置信度增强（防闪烁） ====================
+        # 已经是 CAR 状态时，YOLO 视觉也还看到车，就把置信度抬一把（防闪烁）
         # 用户反馈：车经过检测线的过程中（已进入 CAR 状态），车速不均匀停一下时会闪烁几帧 no_car
         # 根因：车停住后，深度骤变(R1/R3)归零，MOG2运动检测认为"没运动"→ 在融合阶段把中等信号打为 no_car
         # 修复：若 current_state 已经是 car 且 YOLO 视觉仍确认车在检测区(R5≥0.40且至少1框)，
@@ -789,7 +1020,7 @@ class VehicleDetector:
                 confidence = boosted
                 car_vision_boost_applied = True
 
-        # ==================== 距离门控（Vehicle Proximity Gate） ====================
+        # 距离门控（Vehicle Proximity Gate）
         # 有远处深背景(max_depth>25m 桥梁/天空) + 有基线下降(车辆接近导致)
         # 但最近点仍在检测线外(>5.5m) 且无点到达检测线(shallow_count==0)
         # → 强制压低置信度，防止远处车辆+深背景被误判为"部分覆盖货车"
@@ -841,12 +1072,13 @@ class VehicleDetector:
 
     def update(self, depths, frame_bgr=None):
         """
-        更新车辆状态（支持 YOLO 视觉协同）。
+        更新车辆状态（带 YOLO 视觉协同）。
 
-        协同原则：视觉不是独立触发，而是作为 R5 规则加权进入综合判定。
-        - 只传 depths: 走纯深度检测（向后兼容，YOLO 不参与，R5=0）
-        - 传 depths + frame_bgr: 先跑 YOLO 得到 R5，再深度得到 R1-R4，加权综合
+        视觉不单独触发，而是当成 R5 规则加权进综合判定：
+        - 只传 depths：走纯深度检测（向后兼容，YOLO 不参与，R5=0）
+        - 传 depths + frame_bgr：先跑 YOLO 拿到 R5，再跑深度拿 R1-R4，最后加权综合
         """
+        self._update_n += 1
         # Step A: 若传了画面，先跑 YOLO 视觉检测（R5 评分写入 self.last_vision_score）
         if self.yolo_enabled and frame_bgr is not None:
             self.yolo_detect_frame(frame_bgr)
@@ -855,12 +1087,114 @@ class VehicleDetector:
             self.last_vision_score = 0.0
             self._last_yolo_boxes = []
 
+        # P0 夜间自适应：判断亮度和有效门槛
+        self._is_night = False
+        if frame_bgr is not None and (
+                self.night_smooth_alpha > 0 or self.night_confirm_extra > 0
+                or self.night_cooldown_extra > 0):
+            self._is_night = (
+                self._compute_frame_brightness(frame_bgr)
+                < self.night_bright_threshold
+            )
+        is_night = self._is_night
+        self._eff_confirm = (
+            self.car_confirm_frames + (self.night_confirm_extra if is_night else 0)
+        )
+        self._eff_cooldown = (
+            self._cooldown_frames + (self.night_cooldown_extra if is_night else 0)
+        )
+
         depths = np.array(depths, dtype=np.float32)
         valid_mask = ~np.isnan(depths) & (depths > 0)
         depths_clean = np.where(valid_mask, depths, 0.0)
 
+        # 孤立尖峰过滤：单点比上一帧跳变超过 spike_abs_threshold 且全场跳变点占比 <30%，
+        # 就当是深度模型抽风的噪声点，这帧作废；真车进场是整列点联动，不会误杀
+        if self.spike_abs_threshold > 0:
+            prev = self._prev_valid_depths
+            if prev is not None and prev.shape == depths_clean.shape:
+                both = valid_mask & (prev > 0)
+                n_both = int(both.sum())
+                if n_both > 0:
+                    jumped = both & (np.abs(depths_clean - prev) > self.spike_abs_threshold)
+                    n_jumped = int(jumped.sum())
+                    if 0 < n_jumped < max(1, int(n_both * 0.3)):
+                        valid_mask = valid_mask & ~jumped
+                        depths_clean = np.where(valid_mask, depths_clean, 0.0)
+            self._prev_valid_depths = np.where(
+                valid_mask, depths_clean,
+                self._prev_valid_depths if self._prev_valid_depths is not None else 0.0)
+        else:
+            self._prev_valid_depths = None
+
         road_depths = self._get_road_depths(depths_clean)
         road_valid = self._get_valid_road_mask(depths_clean)
+
+        # P0-1 夜间时序平滑：把车灯扫过引起的深度尖峰压下去
+        if is_night and self.night_smooth_alpha > 0:
+            a = self.night_smooth_alpha
+            rd = road_depths.astype(np.float32)
+            if self._ema_road_depths is None or self._ema_road_depths.shape != rd.shape:
+                self._ema_road_depths = rd.copy()
+            else:
+                blended = self._ema_road_depths * (1.0 - a) + rd * a
+                self._ema_road_depths = np.where(road_valid, blended, self._ema_road_depths)
+            road_depths = np.where(road_valid, self._ema_road_depths, 0.0).astype(np.float32)
+        else:
+            self._ema_road_depths = None
+
+        # 基线救援：逐点追踪历史最大深度（在尖峰过滤/夜间平滑之后，污染已被压过）。
+        # 基线迟迟建不起来（视频开头车就占线，预热buffer收不到无车帧）时兜底，
+        # 否则"回no_car要对比基线"永远不满足，状态机会永久卡死在car（两车共用一个信号）
+        if self.baseline_rescue_frames > 0:
+            rd_valid_vals = np.where(road_valid, road_depths, -np.inf)
+            if self._road_max is None or self._road_max.shape != rd_valid_vals.shape:
+                self._road_max = rd_valid_vals
+            else:
+                self._road_max = np.maximum(self._road_max, rd_valid_vals)
+            if (self.baseline is None
+                    and self._update_n >= self.baseline_rescue_frames):
+                rescued = np.where(
+                    np.isfinite(self._road_max) & (self._road_max > 0),
+                    self._road_max, 0.0).astype(np.float32)
+                if int((rescued > 0).sum()) >= self.min_stable_points:
+                    self.baseline = rescued
+
+        # 基线上浮校正：深度只会被遮挡压小，不可能比真实路面更远。
+        # 某点连续高于基线 N 帧 → 基线错了（被占线车污染/救援兜底时该点还没见过路面），抬回观测值
+        if self.baseline is not None and self.baseline_up_snap_frames > 0:
+            if self._above_baseline_cnt is None or len(self._above_baseline_cnt) != len(road_depths):
+                self._above_baseline_cnt = np.zeros(len(road_depths), dtype=np.int32)
+            up_margin = max(self.normal_fluctuation * 2, 2.0)
+            for i in range(min(len(road_depths), len(self.baseline))):
+                if (road_valid[i] and self.baseline[i] > 0
+                        and road_depths[i] - self.baseline[i] > up_margin):
+                    self._above_baseline_cnt[i] += 1
+                    if self._above_baseline_cnt[i] >= self.baseline_up_snap_frames:
+                        self.baseline[i] = float(road_depths[i])
+                        self._above_baseline_cnt[i] = 0
+                else:
+                    self._above_baseline_cnt[i] = 0
+
+        # 基线下沉校正：噪声/漂移导致基线比真实路面偏高零点几米时，
+        # 观测会持续略低于基线 → 被 R1/R3 当真车下降打分，空路面锁死 car。
+        # 真车遮挡是米级下降（>band），亚米级持续偏低 → 基线噪声偏高，压回观测值
+        if self.baseline is not None and self.baseline_down_snap_frames > 0:
+            if self._below_baseline_cnt is None or len(self._below_baseline_cnt) != len(road_depths):
+                self._below_baseline_cnt = np.zeros(len(road_depths), dtype=np.int32)
+            down_band = max(self.normal_fluctuation, 1.5)
+            for i in range(min(len(road_depths), len(self.baseline))):
+                if road_valid[i] and self.baseline[i] > 0:
+                    offset = self.baseline[i] - road_depths[i]
+                    if 0.3 < offset <= down_band:
+                        self._below_baseline_cnt[i] += 1
+                        if self._below_baseline_cnt[i] >= self.baseline_down_snap_frames:
+                            self.baseline[i] = float(road_depths[i])
+                            self._below_baseline_cnt[i] = 0
+                    else:
+                        self._below_baseline_cnt[i] = 0
+                else:
+                    self._below_baseline_cnt[i] = 0
 
         # 更新滑动窗口
         self.history_window.append(road_depths.copy())
@@ -879,28 +1213,50 @@ class VehicleDetector:
         if car_detected:
             # 检测到车辆
             if self.current_state != "car":
-                # 强信号快速通道：conf≥0.7 直接确认，跳过confirm_count
-                if self.last_confidence >= 0.70:
-                    self.confirm_count = self.car_confirm_frames
+                # 冷却期内完全阻止新 car 触发：防止两车间隔阶段噪声误触发
+                # 冷却帧数走 car_exit_cooldown_frames（默认15≈0.5s@30fps），真车最多延迟这点时间确认
+                if self._car_exit_cooldown > 0:
+                    # 冷却期内：不累积 confirm_count，保持当前状态
+                    self.pending_state = self.current_state
+                    # 冷却期内也要递减计数器（否则冷却期会因噪声帧无限延长）
+                    self._car_exit_cooldown -= 1
                 else:
-                    self.confirm_count += 1
-                self.pending_state = "car"
+                    # 非冷却期：正常逻辑
+                    # 强信号快速通道：conf≥0.7 直接确认，跳过confirm_count
+                    if self.last_confidence >= 0.70:
+                        self.confirm_count = self._eff_confirm
+                    else:
+                        self.confirm_count += 1
+                    self.pending_state = "car"
             else:
-                self.confirm_count = self.car_confirm_frames
-            if self.confirm_count >= self.car_confirm_frames:
+                self.confirm_count = self._eff_confirm
+            if self.confirm_count >= self._eff_confirm:
+                if self.current_state != "car":
+                    # 刚进 car：上状态锁，锁内不允许回退，防"确认后立刻闪退再闪进"
+                    self._car_hold_remaining = self.min_car_hold_frames
                 self.current_state = "car"
+                # 车辆确认后清零冷却计数器
+                self._car_exit_cooldown = 0
                 # 预热阶段：异常帧不加入buffer（保护基线）
                 # 正式阶段：清空warmup_buffer
                 if self.baseline is not None:
                     self.warmup_buffer = []
 
         elif self.current_state == "car":
+            # 状态锁：刚确认 car 的 min_car_hold_frames 帧内不做任何回退判定
+            if self._car_hold_remaining > 0:
+                self._car_hold_remaining -= 1
+                self.pending_state = "car"
+                self.confirm_count = self._eff_confirm
+                self.last_depths = depths_clean.copy()
+                # 信号层：car 状态下不发新信号（armed=False 已在上升沿置过）
+                return self.current_state
             # 检查车辆是否离开
-            # ============== YOLO 视觉 HOLD：车停住时禁止状态机回退 ==============
-            # 防闪烁：已确认car后，若YOLO视觉仍确认车在检测区（R5≥0.5 且至少1框），
-            # 跳过"稳定点计数"离开判定；R5≥0.30 弱信号时回退帧门槛 5→12（更难回退）
-            # 与 _detect_car_by_depth 里的 boost 对齐：R5≥0.40 时已有 car 确认增强，
-            # 因此 HOLD 强门槛从 0.50 降到 0.40，保证"boost时绝不回退"
+            # YOLO 视觉 HOLD：车停住时不让状态机回退
+            # 防闪烁：已经确认 car 后，YOLO 视觉还看到车在检测区（R5≥0.5 且有框），
+            # 就跳过"稳定点计数"那套离开判定；R5≥0.30 是弱信号，把回退帧门槛 5→12（更难回退）
+            # 跟 _detect_car_by_depth 里的 boost 对齐：R5≥0.40 时本来就有 car 增强，
+            # 所以 HOLD 强门槛从 0.50 降到 0.40，保证"boost 的时候绝不回退"
             r5_hold = float(getattr(self, 'last_vision_score', 0.0))
             r5_boxes_n_hold = len(getattr(self, '_last_yolo_boxes', []))
             last_conf = float(getattr(self, 'last_confidence', 0.0))
@@ -934,6 +1290,8 @@ class VehicleDetector:
                 self.confirm_count += 1
                 if self.confirm_count >= effective_stable_frames:
                     self.current_state = "no_car"
+                    # 启动冷却期：防止两车间隔阶段噪声误触发新 car
+                    self._car_exit_cooldown = self._eff_cooldown
                     if self.baseline is None:
                         # 无基线，用预热buffer建立基线
                         if len(self.warmup_buffer) >= self.warmup_detect_min:
@@ -950,11 +1308,14 @@ class VehicleDetector:
                     self.confirm_count = 0
             else:
                 self.pending_state = "car"
-                self.confirm_count = self.car_confirm_frames
+                self.confirm_count = self._eff_confirm
 
         else:
             # 无车或未知状态
             self.confirm_count = 0
+            # 递减冷却计数器
+            if self._car_exit_cooldown > 0:
+                self._car_exit_cooldown -= 1
             if self.baseline is None:
                 # 预热阶段：加入buffer
                 self.warmup_buffer.append(road_depths.copy())
@@ -977,6 +1338,16 @@ class VehicleDetector:
                                 road_depths[i] * self.baseline_alpha
                             )
                 self.current_state = "no_car"
+
+        # 信号层：非car→car 上升沿发一次信号并锁存；
+        # 只有状态彻底回 no_car 且冷却结束才解锁，保证一辆车经过只出一个有车信号
+        if self.current_state == "car" and self._signal_armed:
+            if self._update_n - self._last_signal_update >= self.min_signal_interval_frames:
+                self.signal_count += 1
+                self._last_signal_update = self._update_n
+                self._signal_armed = False
+        elif self.current_state == "no_car" and self._car_exit_cooldown <= 0:
+            self._signal_armed = True
 
         self.last_depths = depths_clean.copy()
         return self.current_state
@@ -1013,19 +1384,17 @@ class VehicleDetector:
         return match_points >= min_points
 
 
-# ============================================================
-# 亮度监听器：实时监测环境亮度，动态调整 MOG2 判定权重
-# ============================================================
+# 亮度监听器：实时看环境亮度，动态调 MOG2 的判定权重
 class BrightnessMonitor:
     """
-    实时监测环境亮度，动态调整 MOG2 运动检测的判定权重。
+    实时盯着环境亮度，动态调 MOG2 运动检测的判定权重。
 
-    原理：
-    - 亮度高（白天）：深度模型可靠，MOG2 权重降低（减少误触发）
-    - 亮度中等（黄昏）：MOG2 权重逐步提升
-    - 亮度低（夜间）：深度模型易失效，MOG2 权重最大（辅助判定）
+    道理很简单：
+    - 亮（白天）：深度模型靠谱，MOG2 权重压低点（少误触发）
+    - 中等（黄昏）：MOG2 权重一点点往上抬
+    - 暗（夜里）：深度模型容易失效，MOG2 权重顶到最大来帮着判
 
-    权重范围：[min_weight, max_weight]，通过 EMA 平滑过渡，避免突变。
+    权重在 [min_weight, max_weight] 之间，用 EMA 平滑过去，免得突然跳变。
     """
 
     def __init__(self,
@@ -1038,15 +1407,15 @@ class BrightnessMonitor:
                  sample_height=90,
                  log_interval=50):
         """
-        Args:
-            bright_high: 高亮度阈值（0-255），高于此值为白天，MOG2 权重最低
-            bright_mid: 中亮度阈值（0-255），低于此值为夜间，MOG2 权重最高
-            min_weight: 白天 MOG2 最小权重（0~1）
-            max_weight: 夜间 MOG2 最大权重（0~1）
-            weight_alpha: 权重 EMA 平滑系数（0~1，越小过渡越慢）
-            sample_width: 亮度采样宽度（降采样以降低开销）
-            sample_height: 亮度采样高度
-            log_interval: 每 N 帧记录一次日志
+        参数：
+            bright_high：高亮度阈值（0-255），比它亮就是白天，MOG2 权重最低
+            bright_mid：中亮度阈值（0-255），比它暗就是夜里，MOG2 权重最高
+            min_weight：白天 MOG2 的最小权重（0~1）
+            max_weight：夜里 MOG2 的最大权重（0~1）
+            weight_alpha：权重 EMA 平滑系数（0~1，越小过渡越慢）
+            sample_width：亮度采样宽度（降采样省开销）
+            sample_height：亮度采样高度
+            log_interval：每 N 帧记一次日志
         """
         self.bright_high = bright_high
         self.bright_mid = bright_mid
@@ -1067,40 +1436,19 @@ class BrightnessMonitor:
         self.performance_log = []  # [(frame, detect_time_ms, mog2_time_ms), ...]
 
     def compute_brightness(self, frame):
-        """
-        计算帧的平均亮度（降采样加速）。
-
-        Args:
-            frame: BGR 图像
-
-        Returns:
-            float: 平均亮度值 (0-255)
-        """
-        h, w = frame.shape[:2]
-        # 降采样到小尺寸以减少计算量
-        scale_x = min(1.0, self.sample_width / w)
-        scale_y = min(1.0, self.sample_height / h)
-        if scale_x < 1.0 or scale_y < 1.0:
-            small = cv2.resize(frame, None, fx=scale_x, fy=scale_y,
-                               interpolation=cv2.INTER_AREA)
-        else:
-            small = frame
-        gray = cv2.cvtColor(small, cv2.COLOR_BGR2GRAY)
-        return float(np.mean(gray))
+        """算一下这帧的平均亮度（降采样更快）。frame 是 BGR 图，返回 0-255 的亮度值。"""
+        return _frame_mean_brightness(frame, self.sample_width, self.sample_height,
+                                      independent_scale=True)
 
     def brightness_to_weight(self, brightness):
         """
-        将亮度映射到 MOG2 判定权重（线性分段）。
+        把亮度映射成 MOG2 权重（分段线性）。
 
-        - brightness >= bright_high → min_weight（白天，MOG2 低权重）
-        - bright_mid <= brightness < bright_high → 线性插值
-        - brightness < bright_mid → max_weight（夜间，MOG2 高权重）
+        - 亮度 ≥ bright_high → min_weight（白天，MOG2 低权重）
+        - bright_mid ≤ 亮度 < bright_high → 线性插值
+        - 亮度 < bright_mid → max_weight（夜里，MOG2 高权重）
 
-        Args:
-            brightness: 当前亮度值 (0-255)
-
-        Returns:
-            float: MOG2 权重 [min_weight, max_weight]
+        传入当前亮度（0-255），返回 [min_weight, max_weight] 里的权重。
         """
         if brightness >= self.bright_high:
             return self.min_weight
@@ -1111,15 +1459,8 @@ class BrightnessMonitor:
             return self.max_weight - ratio * (self.max_weight - self.min_weight)
 
     def update(self, frame):
-        """
-        更新亮度监测和 MOG2 权重（每帧调用）。
-
-        Args:
-            frame: BGR 图像
-
-        Returns:
-            tuple: (current_brightness, current_weight, brightness_level)
-        """
+        """每帧调一次，更新亮度监测和 MOG2 权重。
+        frame 是 BGR 图，返回 (当前亮度, 当前权重, 亮度等级)。"""
         self.frame_count += 1
         raw_brightness = self.compute_brightness(frame)
 
@@ -1188,26 +1529,24 @@ class BrightnessMonitor:
         self.brightness_log = []
 
 
-# ============================================================
-# MOG2 运动检测器：检测运动目标是否经过检测线
-# ============================================================
+# MOG2 运动检测器：看有没有运动目标从检测线经过
 class MotionLineDetector:
     """
-    基于 MOG2 背景减除的运动检测器（带确认帧机制 + 动态亮度权重）。
+    靠 MOG2 背景减除做运动检测（带确认帧 + 动态亮度权重）。
 
-    工作原理：
-    1. 用 MOG2 建立背景模型，提取前景掩码（运动物体）
-    2. 在检测线（像素监测点所在的垂直线）附近设置一条窄带
-    3. 统计窄带内的前景像素数量
-    4. 必须连续 N 帧检测到运动才确认 → 防止单帧噪声误判
-    5. 根据环境亮度动态调整判定灵敏度：
-       - 白天（亮度高）：提高 min_motion_pixels 和 confirm_frames，降低误触发
-       - 夜间（亮度低）：降低 min_motion_pixels 和 confirm_frames，更敏感
+    大概这么走：
+    1. MOG2 先建背景模型，把前景（动的东西）抠出来
+    2. 在检测线（监测点所在的垂直线）附近划一条窄带
+    3. 数窄带里的前景像素有多少
+    4. 得连着 N 帧都有运动才算数 → 防单帧噪声乱判
+    5. 按环境亮度动态调灵敏度：
+       - 白天（亮）：抬高 min_motion_pixels 和 confirm_frames，少误触发
+       - 夜里（暗）：压低 min_motion_pixels 和 confirm_frames，更灵敏
 
-    注意：MOG2 单独检测到运动不直接判定有车，必须与深度检测配合：
-    - 深度检测到 car → 直接判定有车（可靠）
-    - MOG2 确认运动 + 深度有变化 → 判定有车
-    - MOG2 确认运动 + 深度稳定 → 可能是反光/噪声，不判定
+    注意：MOG2 光看到运动不能直接说有车，得跟深度配合：
+    - 深度判到 car → 直接算有车（最靠谱）
+    - MOG2 确认有运动 + 深度有变化 → 算有车
+    - MOG2 确认有运动 + 深度没动 → 多半是反光/噪声，不算
     """
 
     def __init__(self, detect_x=40, strip_width=30,
@@ -1215,16 +1554,16 @@ class MotionLineDetector:
                  detect_shadow=False, warmup_frames=30,
                  confirm_frames=3, brightness_monitor=None):
         """
-        Args:
-            detect_x: 检测线 x 坐标（像素监测点所在垂直线）
-            strip_width: 检测带宽度（以 detect_x 为中心的左右各 strip_width/2 像素）
-            min_motion_pixels: 基础最小运动像素数（会被亮度权重动态调整）
-            history: MOG2 背景模型的历史帧数
-            var_threshold: MOG2 像素与背景模型的方差阈值
-            detect_shadow: 是否检测阴影（True=检测，但可能误判）
-            warmup_frames: MOG2 预热帧数，前 N 帧不检测（背景模型未稳定）
-            confirm_frames: 基础确认帧数（会被亮度权重动态调整）
-            brightness_monitor: BrightnessMonitor 实例，提供动态权重
+        参数：
+            detect_x：检测线 x 坐标（监测点所在的那条竖线）
+            strip_width：检测带宽度（以 detect_x 为中心，左右各 strip_width/2 像素）
+            min_motion_pixels：基础最小运动像素数（会被亮度权重动态改）
+            history：MOG2 背景模型的历史帧数
+            var_threshold：MOG2 像素跟背景模型的方差阈值
+            detect_shadow：要不要检测阴影（True=检测，但可能误判）
+            warmup_frames：MOG2 预热帧数，前 N 帧先不检测（背景模型还没稳）
+            confirm_frames：基础确认帧数（会被亮度权重动态改）
+            brightness_monitor：BrightnessMonitor 实例，给动态权重
         """
         self.detect_x = detect_x
         self.strip_width = max(4, strip_width)
@@ -1252,18 +1591,17 @@ class MotionLineDetector:
 
     def _apply_weight(self, weight):
         """
-        根据权重调整有效检测阈值。
+        按权重调一下真正生效的检测阈值。
 
-        权重越高（夜间）：
-        - 降低 min_motion_pixels（更敏感，能检测低光下的微弱运动）
-        - 降低 confirm_frames（更快确认，减少延迟）
+        权重高（夜里）：
+        - min_motion_pixels 调低（更敏感，暗光下微弱运动也抓得到）
+        - confirm_frames 调低（更快确认，少点延迟）
 
-        权重越低（白天）：
-        - 提高 min_motion_pixels（更严格，过滤误触发）
-        - 提高 confirm_frames（更慢确认，确保可靠）
+        权重低（白天）：
+        - min_motion_pixels 调高（更严，滤掉误触发）
+        - confirm_frames 调高（确认慢一点，稳当）
 
-        Args:
-            weight: 当前权重 [0.4, 1.0]
+        weight 是当前权重，范围 [0.4, 1.0]。
         """
         self.current_weight = weight
         # 高权重 → 低阈值（夜间敏感），低权重 → 高阈值（白天严格）
@@ -1280,15 +1618,8 @@ class MotionLineDetector:
         )
 
     def update(self, frame):
-        """
-        输入一帧图像，返回是否有运动目标经过检测线。
-
-        Args:
-            frame: BGR 图像 (h, w, 3)
-
-        Returns:
-            state: "motion" / "no_motion" / "unknown"
-        """
+        """喂一帧进来，看有没有运动目标从检测线过。
+        frame 是 BGR 图 (h, w, 3)，返回 "motion" / "no_motion" / "unknown"。"""
         self.frame_count += 1
         h, w = frame.shape[:2]
 
@@ -1427,32 +1758,11 @@ def _draw_motion_strip(vis, detector, w, h):
 def process_image(model, processor, img_path, output_dir, device, pixel_points=None):
     """处理单张图片：输出对比图 + 深度图 + 米数 .npy"""
     img = cv2.imread(img_path)
-    img_rgb = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
-
-    inputs = processor(images=[img_rgb], return_tensors="pt").to(device)
-
-    t0 = time.time()
-    with torch.no_grad():
-        outputs = model(**inputs)
-        depth = outputs.predicted_depth
-    frame_time = (time.time() - t0) * 1000  # 毫秒
-
-    # 统一成 4D 再插值
-    if depth.dim() == 3:
-        depth = depth.unsqueeze(1)
+    depth, frame_time = _infer_depth_map(model, processor, img, device)
     h, w = img.shape[:2]
-    depth = torch.nn.functional.interpolate(
-        depth, size=(h, w), mode="bicubic", align_corners=False
-    ).squeeze().cpu().numpy()
 
     # 计算所有像素点深度值
-    pixel_depths = []
-    if pixel_points:
-        for px, py in pixel_points:
-            if 0 <= px < w and 0 <= py < h:
-                pixel_depths.append(float(depth[py, px]))
-            else:
-                pixel_depths.append(None)
+    pixel_depths = _extract_pixel_depths(depth, pixel_points or [])
 
     depth_vis, d_min, d_max = depth_to_colormap(depth)
     depth_vis = annotate_depth(depth_vis, d_min, d_max, h, pixel_points, pixel_depths if pixel_depths else None, frame_time)
@@ -1503,60 +1813,10 @@ def process_video(model, processor, video_path, output_dir, device,
     processed = 0
     depths_list = []
 
-    # 初始化深度车辆检测器
-    detector = None
-    if car_detector_config and pixel_points:
-        effective_fps = fps / frame_step if fps > 0 and frame_step > 0 else fps
-        detector = VehicleDetector(
-            n_points=len(pixel_points),
-            distance_drop_threshold=car_detector_config["distance_drop_threshold"],
-            normal_fluctuation=car_detector_config["normal_fluctuation"],
-            fps=effective_fps,
-            baseline_warmup=car_detector_config["baseline_warmup"],
-            baseline_alpha=car_detector_config["baseline_alpha"],
-            min_car_points=car_detector_config["min_car_points"],
-            min_stable_points=car_detector_config["min_stable_points"],
-            car_confirm_frames=car_detector_config["car_confirm_frames"],
-            stable_confirm_frames=car_detector_config["stable_confirm_frames"],
-            max_detect_depth=car_detector_config.get("max_detect_depth", 30.0),
-            relative_drop_threshold=car_detector_config.get("relative_drop_threshold", 0.3),
-        )
-        print(f"  [Car] 深度车辆检测已启用")
-
-    # 初始化 MOG2 运动检测器
-    motion_detector = None
-    mog2_config = car_detector_config.get("mog2", {}) if car_detector_config else {}
-    mog2_enabled = mog2_config.get("enabled", True) if mog2_config else True
-
-    # 初始化亮度监听器（依赖 mog2_config，需在之后）
-    brightness_monitor = None
-    if mog2_enabled and pixel_points:
-        mog2_bright_cfg = mog2_config.get("brightness", {})
-        brightness_monitor = BrightnessMonitor(
-            bright_high=mog2_bright_cfg.get("bright_high", 180.0),
-            bright_mid=mog2_bright_cfg.get("bright_mid", 80.0),
-            min_weight=mog2_bright_cfg.get("min_weight", 0.4),
-            max_weight=mog2_bright_cfg.get("max_weight", 1.0),
-            weight_alpha=mog2_bright_cfg.get("weight_alpha", 0.05),
-            log_interval=mog2_bright_cfg.get("log_interval", 50),
-        )
-
-    if mog2_enabled and pixel_points:
-        detect_x = pixel_points[0][0] if pixel_points else 40
-        motion_detector = MotionLineDetector(
-            detect_x=detect_x,
-            strip_width=mog2_config.get("strip_width", 30),
-            min_motion_pixels=mog2_config.get("min_motion_pixels", 50),
-            history=mog2_config.get("history", 300),
-            var_threshold=mog2_config.get("var_threshold", 25),
-            detect_shadow=mog2_config.get("detect_shadow", False),
-            warmup_frames=mog2_config.get("warmup_frames", 30),
-            confirm_frames=mog2_config.get("confirm_frames", 3),
-            brightness_monitor=brightness_monitor,
-        )
-        print(f"  [MOG2] 运动检测已启用 | 检测线 x={detect_x}, 带宽={mog2_config.get('strip_width', 30)}px, 确认={mog2_config.get('confirm_frames', 3)}帧")
-        if brightness_monitor:
-            print(f"  [亮度] 动态权重已启用 | 白天≥{brightness_monitor.bright_high}→权重={brightness_monitor.min_weight:.1f} | 夜间<{brightness_monitor.bright_mid}→权重={brightness_monitor.max_weight:.1f}")
+    # 初始化检测流水线（深度车辆检测器 + 亮度监听 + MOG2 运动检测）
+    effective_fps = fps / frame_step if fps > 0 and frame_step > 0 else fps
+    detector, brightness_monitor, motion_detector = build_detector_pipeline(
+        car_detector_config, pixel_points, effective_fps, verbose="basic")
 
     print(f"[Video] 处理视频: {Path(video_path).name}")
     print(f"  分辨率: {w}x{h}, FPS: {fps:.1f}, 总帧数: {total_frames}")
@@ -1566,7 +1826,7 @@ def process_video(model, processor, video_path, output_dir, device,
     if max_frames:
         n_to_process = min(n_to_process, max_frames)
 
-    # ===== 显示平滑：监测点深度 + 画面深度范围 EMA（去帧间抖动，不影响检测算法）=====
+    # 显示平滑：监测点深度 + 画面深度范围做 EMA，去帧间抖动，不碰检测算法
     _ema_depths = None          # 监测点 EMA 缓冲
     _ema_d_min = None           # 画面最小深度 EMA
     _ema_d_max = None           # 画面最大深度 EMA
@@ -1579,34 +1839,14 @@ def process_video(model, processor, video_path, output_dir, device,
             break
 
         if frame_idx % frame_step == 0:
-            img_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-            inputs = processor(images=[img_rgb], return_tensors="pt").to(device)
-
-            t0 = time.time()
-            with torch.no_grad():
-                outputs = model(**inputs)
-                depth = outputs.predicted_depth
-            frame_time = (time.time() - t0) * 1000  # 毫秒
-
-            # 统一成 4D 再插值
-            if depth.dim() == 3:
-                depth = depth.unsqueeze(1)
-            depth = torch.nn.functional.interpolate(
-                depth, size=(h, w), mode="bicubic", align_corners=False
-            ).squeeze().cpu().numpy()
+            depth, frame_time = _infer_depth_map(model, processor, frame, device)
 
             depth_vis, d_min_raw, d_max_raw = depth_to_colormap(depth)
 
             # 计算所有像素点深度值（原始值，用于检测算法）
-            pixel_depths = []
-            if pixel_points:
-                for px, py in pixel_points:
-                    if 0 <= px < w and 0 <= py < h:
-                        pixel_depths.append(float(depth[py, px]))
-                    else:
-                        pixel_depths.append(None)
+            pixel_depths = _extract_pixel_depths(depth, pixel_points or [])
 
-            # ===== 仅用于显示的 EMA 平滑（不影响检测逻辑）=====
+            # 纯为显示做的 EMA 平滑，不影响检测逻辑
             # _ema_* 变量在外层 while True 循环前定义，与本分支同属函数作用域，无需 nonlocal
             # 监测点深度平滑
             if pixel_depths:
@@ -1614,9 +1854,9 @@ def process_video(model, processor, video_path, output_dir, device,
                     _ema_depths = list(pixel_depths)
                 else:
                     for i, d in enumerate(pixel_depths):
-                        if d is None:
+                        if d is None or (isinstance(d, float) and d != d):
                             continue
-                        if _ema_depths[i] is None:
+                        if _ema_depths[i] is None or (isinstance(_ema_depths[i], float) and _ema_depths[i] != _ema_depths[i]):
                             _ema_depths[i] = d
                         else:
                             _ema_depths[i] = _ema_alpha * d + (1 - _ema_alpha) * _ema_depths[i]
@@ -1646,14 +1886,15 @@ def process_video(model, processor, video_path, output_dir, device,
                 # 在原始帧上绘制检测带
                 frame = _draw_motion_strip(frame, motion_detector, w, h)
 
-            # 融合判定（v4: 亮度权重 + 深度变化验证）
-            # 深度检测可靠：car → 直接判定有车
-            # MOG2 辅助：根据当前亮度权重调整判定策略
-            #   - 夜间（weight≥0.7）：MOG2确认+深度基本变化 → 有车
-            #   - 黄昏（0.5≤weight<0.7）：MOG2确认+深度明显变化 → 有车
-            #   - 白天（weight<0.5）：MOG2确认+深度强烈变化 → 有车
-            # 深度为 no_car 时，MOG2 不覆盖（可能是反光/远处运动）
-            # 融合判定（v5: 深度+MOG2双重验证）
+            # 融合判定（主流水线简化版：深度 + MOG2 双重验证，没带 YOLO 视觉协同）
+            # 注意：这跟 detect_car.py 里的 fuse_v8_car_state()（YOLO + 多规则加权）是两码事，
+            # 这里只给 detect.py 状态条显示用，别混。
+            #   - 深度靠谱：car → 直接算有车
+            #   - MOG2 辅助：按当前亮度权重换策略
+            #     - 夜里（weight≥0.7）：MOG2确认 + 深度基本变化 → 有车
+            #     - 黄昏（0.5≤weight<0.7）：MOG2确认 + 深度明显变化 → 有车
+            #     - 白天（weight<0.5）：MOG2确认 + 深度剧烈变化 → 有车
+            #   - 深度是 no_car 时 MOG2 不覆盖（可能是反光/远处在动）
             mog2_confirmed = motion_detector.is_confirmed() if motion_detector else False
             mog2_weight = motion_detector.get_current_weight() if motion_detector else 0.5
             depth_conf = detector.last_confidence if detector else 0.0
@@ -1701,7 +1942,8 @@ def process_video(model, processor, video_path, output_dir, device,
             # 进度条实时显示深度范围 + 监测点深度 + 车辆状态（使用显示用平滑值，避免抖动刷屏）
             postfix = f"depth={display_d_min:.1f}~{display_d_max:.1f}m"
             if display_depths:
-                valid_depths = [d for d in display_depths if d is not None]
+                valid_depths = [d for d in display_depths
+                                if d is not None and not (isinstance(d, float) and d != d)]
                 if valid_depths:
                     postfix += " pts=[" + ",".join(f"{d:.1f}" for d in valid_depths) + "]m"
             if final_state:
@@ -1854,15 +2096,195 @@ def _abs_path(root, path):
     return os.path.join(root, path)
 
 
+def build_detector_config(car_cfg, root, scalar_values, yolo_model_default="yolov8n.pt"):
+    """
+    从 car_detect 配置段拼出统一的 detector_config 字典（detect_car / detect_sel_videos 一起用）。
+    - scalar_values：各脚本自己解析好的标量参数 dict，直接并进来。
+      detect_car 走 CLI(args.*)、detect_sel_videos 走 car_cfg.get(...)，两边默认值不一样，
+      所以让调用方传进来，各自的老行为都不动。
+    - yolo / mog2 / weights 子块从 car_cfg 读。
+    - P0-1 配置透传：judge_mlp / night / saturation_threshold / clahe 四个子块直接并进来，
+      检测器初始化时按 config.yaml 生效，不再掉回代码里写死的默认。
+    """
+    car_cfg = car_cfg or {}
+    yolo_cfg = car_cfg.get("yolo", {}) or {}
+    mog2_cfg = car_cfg.get("mog2", {}) or {}
+    weights_cfg = car_cfg.get("weights", {}) or {}
+
+    config = dict(scalar_values or {})
+    config["yolo"] = {
+        "enabled": bool(yolo_cfg.get("enabled", True)),
+        # 转绝对路径：避免当前工作目录不对时找不着
+        "model_path": _abs_path(root, str(yolo_cfg.get("model_path", yolo_model_default))),
+        "device": str(yolo_cfg.get("device", "") or ""),
+        "confidence": float(yolo_cfg.get("confidence", 0.40)),
+        "iou": float(yolo_cfg.get("iou", 0.45)),
+        "vehicle_classes": list(yolo_cfg.get("vehicle_classes", [1, 2, 3, 5, 7])),
+        "enter_bottom_ratio": float(yolo_cfg.get("enter_bottom_ratio", 0.30)),
+        "min_box_ratio": float(yolo_cfg.get("min_box_ratio", 0.02)),
+        "cross_tolerance_px": float(yolo_cfg.get("cross_tolerance_px", 15)),
+    }
+    config["weights"] = dict(weights_cfg) if weights_cfg else None
+    config["mog2"] = {
+        "enabled": bool(mog2_cfg.get("enabled", True)),
+        "strip_width": int(mog2_cfg.get("strip_width", 30)),
+        "min_motion_pixels": int(mog2_cfg.get("min_motion_pixels", 50)),
+        "history": int(mog2_cfg.get("history", 300)),
+        "var_threshold": int(mog2_cfg.get("var_threshold", 25)),
+        "detect_shadow": bool(mog2_cfg.get("detect_shadow", False)),
+        "warmup_frames": int(mog2_cfg.get("warmup_frames", 30)),
+        "confirm_frames": int(mog2_cfg.get("confirm_frames", 3)),
+        "brightness": dict(mog2_cfg.get("brightness", {}) or {}),
+    }
+    # P0-1 新透传这四个配置子块（之前两个脚本都没从 config.yaml 透传）
+    config["judge_mlp"] = dict(car_cfg.get("judge_mlp", {}) or {})
+    config["night"] = dict(car_cfg.get("night", {}) or {})
+    config["saturation_threshold"] = int(car_cfg.get("saturation_threshold", 235))
+    config["clahe"] = dict(car_cfg.get("clahe", {}) or {})
+    # 一车一信号 + 夜间专属屏蔽透传
+    config["sat_night_only"] = bool(car_cfg.get("sat_night_only", True))
+    config["spike_abs_threshold"] = float(car_cfg.get("spike_abs_threshold", 8.0))
+    config["min_car_hold_frames"] = int(car_cfg.get("min_car_hold_frames", 10))
+    config["min_signal_interval_frames"] = int(car_cfg.get("min_signal_interval_frames", 15))
+    config["car_exit_cooldown_frames"] = int(car_cfg.get("car_exit_cooldown_frames", 15))
+    config["baseline_rescue_frames"] = int(car_cfg.get("baseline_rescue_frames", 30))
+    config["baseline_up_snap_frames"] = int(car_cfg.get("baseline_up_snap_frames", 10))
+    config["baseline_down_snap_frames"] = int(car_cfg.get("baseline_down_snap_frames", 10))
+    return config
+
+
+# 检测流水线工厂：4 处初始化块统一走这里，省得重复写
+def build_detector_pipeline(detector_config, pixel_points, effective_fps,
+                            with_vision=False, verbose="none", yolo_model_path_default="yolov8n.pt"):
+    """
+    搭检测流水线：VehicleDetector + BrightnessMonitor + MotionLineDetector。
+
+    原来 detect.py(process_video/preview_video)、detect_car.py、detect_sel_videos.py
+    里散着 4 份一模一样的初始化代码，这里合成一份：
+    - with_vision=False（detect.py 主流水线，原来不带视觉/夜间参数）：跟重构前一模一样
+    - with_vision=True（car/sel）：YOLO 视觉 + 夜间自适应参数跟着 detector_config 走
+    - verbose 管打印，保持各脚本原来的输出风格：
+      "none"  = 不打印（detect_sel_videos.py 批量跑时静默）
+      "basic" = [Car]/[MOG2]/[亮度]（detect.py 主流水线）
+      "full"  = [YOLO]/[权重]/[阈值]/[MOG2]/[亮度]（detect_car.py）
+    返回 (detector, brightness_monitor, motion_detector)，没启用的那项是 None。
+    """
+    cfg = detector_config or {}
+    yolo_cfg = cfg.get("yolo", {}) or {}
+    weights_cfg = cfg.get("weights", {}) or {}
+    mog2_config = cfg.get("mog2", {}) or {}
+    mog2_enabled = bool(mog2_config.get("enabled", True))
+
+    # 深度车辆检测器
+    detector = None
+    if detector_config and pixel_points:
+        rule_weights = None
+        if with_vision and weights_cfg:
+            # 从配置映射到 detector 内部 key (R1..R5)
+            rule_weights = {
+                'R1': float(weights_cfg.get("R1_way4_depth_jump", 0.10)),
+                'R2': float(weights_cfg.get("R2_way5_abs_depth", 0.25)),
+                'R3': float(weights_cfg.get("R3_way1_baseline", 0.25)),
+                'R4': float(weights_cfg.get("R4_vehicle_region", 0.10)),
+                'R5': float(weights_cfg.get("R5_yolo_vision", 0.30)),
+            }
+        kwargs = dict(
+            n_points=len(pixel_points),
+            distance_drop_threshold=cfg["distance_drop_threshold"],
+            normal_fluctuation=cfg["normal_fluctuation"],
+            fps=effective_fps,
+            baseline_warmup=cfg["baseline_warmup"],
+            baseline_alpha=cfg["baseline_alpha"],
+            min_car_points=cfg["min_car_points"],
+            min_stable_points=cfg["min_stable_points"],
+            car_confirm_frames=cfg["car_confirm_frames"],
+            stable_confirm_frames=cfg["stable_confirm_frames"],
+            max_detect_depth=cfg.get("max_detect_depth", 30.0),
+            relative_drop_threshold=cfg.get("relative_drop_threshold", 0.3),
+            rule_weights=rule_weights,
+            car_confidence_threshold=float(cfg.get("car_confidence_threshold", 0.470)),
+            # 一车一信号三件套（config 透传，键不存在就用默认）
+            min_car_hold_frames=int(cfg.get("min_car_hold_frames", 10)),
+            min_signal_interval_frames=int(cfg.get("min_signal_interval_frames", 15)),
+            spike_abs_threshold=float(cfg.get("spike_abs_threshold", 8.0)),
+            car_exit_cooldown_frames=int(cfg.get("car_exit_cooldown_frames", 15)),
+            baseline_rescue_frames=int(cfg.get("baseline_rescue_frames", 30)),
+            baseline_up_snap_frames=int(cfg.get("baseline_up_snap_frames", 10)),
+            baseline_down_snap_frames=int(cfg.get("baseline_down_snap_frames", 10)),
+        )
+        if with_vision:
+            kwargs.update(
+                # YOLO 视觉检测参数
+                yolo_enabled=bool(yolo_cfg.get("enabled", False)),
+                yolo_model_path=str(yolo_cfg.get("model_path", yolo_model_path_default)),
+                yolo_device=str(yolo_cfg.get("device", "") or ""),
+                yolo_confidence=float(yolo_cfg.get("confidence", 0.40)),
+                yolo_iou=float(yolo_cfg.get("iou", 0.45)),
+                yolo_vehicle_classes=tuple(int(c) for c in yolo_cfg.get("vehicle_classes", [1, 2, 3, 5, 7])),
+                yolo_enter_bottom_ratio=float(yolo_cfg.get("enter_bottom_ratio", 0.30)),
+                yolo_min_box_ratio=float(yolo_cfg.get("min_box_ratio", 0.02)),
+                yolo_detect_x=(pixel_points[0][0] if pixel_points else 40),
+                yolo_cross_tolerance=float(yolo_cfg.get("cross_tolerance_px", 15)),
+                # 夜间自适应参数
+                night_bright_threshold=float(cfg.get("night", {}).get("bright_threshold", 80.0)),
+                night_smooth_alpha=float(cfg.get("night", {}).get("smooth_alpha", 0.35)) if cfg.get("night", {}).get("enabled", True) else 0.0,
+                night_confirm_extra=int(cfg.get("night", {}).get("confirm_extra", 2)) if cfg.get("night", {}).get("enabled", True) else 0,
+                night_cooldown_extra=int(cfg.get("night", {}).get("cooldown_extra", 20)) if cfg.get("night", {}).get("enabled", True) else 0,
+            )
+        detector = VehicleDetector(**kwargs)
+        if verbose == "basic":
+            print(f"  [Car] 深度车辆检测已启用")
+        if kwargs.get("yolo_enabled", False):
+            # 进入 tqdm 进度条之前先确保 YOLO 已加载（避免在进度条首帧 print 打断它）
+            detector._ensure_yolo_loaded()
+            if verbose == "full":
+                print(f"  [YOLO] 视觉检测已启用 | 模型={yolo_cfg.get('model_path')} | 进入检测区阈值=下{float(yolo_cfg.get('enter_bottom_ratio', 0.30)) * 100:.0f}% | 置信度≥{float(yolo_cfg.get('confidence', 0.40)):.2f}")
+                if rule_weights:
+                    print(f"  [权重] R1={rule_weights['R1']:.2f}(骤变) R2={rule_weights['R2']:.2f}(绝对深度) R3={rule_weights['R3']:.2f}(基线) R4={rule_weights['R4']:.2f}(统计) R5={rule_weights['R5']:.2f}(视觉) = {sum(rule_weights.values()):.2f}")
+                    print(f"  [阈值] car_confidence_threshold = {cfg.get('car_confidence_threshold', 0.470):.3f}")
+
+    # MOG2 运动检测 + 亮度监听
+    brightness_monitor = None
+    motion_detector = None
+    if mog2_enabled and pixel_points:
+        mog2_bright_cfg = mog2_config.get("brightness", {}) or {}
+        brightness_monitor = BrightnessMonitor(
+            bright_high=mog2_bright_cfg.get("bright_high", 180.0),
+            bright_mid=mog2_bright_cfg.get("bright_mid", 80.0),
+            min_weight=mog2_bright_cfg.get("min_weight", 0.4),
+            max_weight=mog2_bright_cfg.get("max_weight", 1.0),
+            weight_alpha=mog2_bright_cfg.get("weight_alpha", 0.05),
+            log_interval=mog2_bright_cfg.get("log_interval", 50),
+        )
+        detect_x = pixel_points[0][0] if pixel_points else 40
+        motion_detector = MotionLineDetector(
+            detect_x=detect_x,
+            strip_width=int(mog2_config.get("strip_width", 30)),
+            min_motion_pixels=int(mog2_config.get("min_motion_pixels", 50)),
+            history=int(mog2_config.get("history", 300)),
+            var_threshold=int(mog2_config.get("var_threshold", 25)),
+            detect_shadow=bool(mog2_config.get("detect_shadow", False)),
+            warmup_frames=int(mog2_config.get("warmup_frames", 30)),
+            confirm_frames=int(mog2_config.get("confirm_frames", 3)),
+            brightness_monitor=brightness_monitor,
+        )
+        if verbose in ("basic", "full"):
+            print(f"  [MOG2] 运动检测已启用 | 检测线 x={detect_x}, 带宽={mog2_config.get('strip_width', 30)}px, 确认={mog2_config.get('confirm_frames', 3)}帧")
+            if brightness_monitor:
+                print(f"  [亮度] 动态权重已启用 | 白天≥{brightness_monitor.bright_high}→权重={brightness_monitor.min_weight:.1f} | 夜间<{brightness_monitor.bright_mid}→权重={brightness_monitor.max_weight:.1f}")
+
+    return detector, brightness_monitor, motion_detector
+
+
 def _parse_pixel_points(points_str, count, img_w, img_h):
-    """解析像素点配置，返回 [(x,y), ...] 列表
-    - points_str: 分号分隔的多坐标字符串，如 "320,240;640,480"
-    - count: 自动生成的点数量（仅当 points_str 为空时生效）
-    - img_w, img_h: 画面尺寸
+    """解析像素点配置，返回 [(x,y), ...] 列表。
+    points_str 是分号隔开的坐标串，比如 "320,240;640,480"；
+    count 是自动生成的点数（只在 points_str 为空时才用）；
+    img_w/img_h 是画面尺寸。
     规则：
-    1. points_str 非空 → 解析自定义坐标列表
-    2. points_str 为空且 count=15 → 双列非对称布局（左列x=40共7个点，右列x=55共8个点）
-    3. points_str 为空且 count 为偶数 → 双列对称布局（左列x=40，右列x=55）
+    1. points_str 有内容 → 直接解析自定义坐标
+    2. points_str 为空且 count=15 → 双列非对称布局（左列 x=40 共 7 个点，右列 x=55 共 8 个点）
+    3. points_str 为空且 count 为偶数 → 双列对称布局（左列 x=40，右列 x=55）
     4. points_str 为空且 count 为奇数（≠15） → 单列布局（x=40）
     """
     points_str = str(points_str or "").strip()
@@ -1947,30 +2369,10 @@ def _parse_pixel_points(points_str, count, img_w, img_h):
 def preview_image(model, processor, img_path, device, pixel_points=None):
     """预览单张图片：imshow 显示，不保存文件"""
     img = cv2.imread(img_path)
-    img_rgb = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
-
-    inputs = processor(images=[img_rgb], return_tensors="pt").to(device)
-
-    t0 = time.time()
-    with torch.no_grad():
-        outputs = model(**inputs)
-        depth = outputs.predicted_depth
-    frame_time = (time.time() - t0) * 1000
-
-    if depth.dim() == 3:
-        depth = depth.unsqueeze(1)
+    depth, frame_time = _infer_depth_map(model, processor, img, device)
     h, w = img.shape[:2]
-    depth = torch.nn.functional.interpolate(
-        depth, size=(h, w), mode="bicubic", align_corners=False
-    ).squeeze().cpu().numpy()
 
-    pixel_depths = []
-    if pixel_points:
-        for px, py in pixel_points:
-            if 0 <= px < w and 0 <= py < h:
-                pixel_depths.append(float(depth[py, px]))
-            else:
-                pixel_depths.append(None)
+    pixel_depths = _extract_pixel_depths(depth, pixel_points or [])
 
     depth_vis, d_min, d_max = depth_to_colormap(depth)
     depth_vis = annotate_depth(depth_vis, d_min, d_max, h, pixel_points, pixel_depths if pixel_depths else None, frame_time)
@@ -2003,60 +2405,10 @@ def preview_video(model, processor, video_path, device,
     print(f"  分辨率: {w}x{h}, FPS: {fps:.1f}, 总帧数: {total_frames}")
     print(f"  [提示] 按 q 退出, 空格暂停/继续")
 
-    # 初始化深度车辆检测器
-    detector = None
-    if car_detector_config and pixel_points:
-        effective_fps = fps / frame_step if fps > 0 and frame_step > 0 else fps
-        detector = VehicleDetector(
-            n_points=len(pixel_points),
-            distance_drop_threshold=car_detector_config["distance_drop_threshold"],
-            normal_fluctuation=car_detector_config["normal_fluctuation"],
-            fps=effective_fps,
-            baseline_warmup=car_detector_config["baseline_warmup"],
-            baseline_alpha=car_detector_config["baseline_alpha"],
-            min_car_points=car_detector_config["min_car_points"],
-            min_stable_points=car_detector_config["min_stable_points"],
-            car_confirm_frames=car_detector_config["car_confirm_frames"],
-            stable_confirm_frames=car_detector_config["stable_confirm_frames"],
-            max_detect_depth=car_detector_config.get("max_detect_depth", 30.0),
-            relative_drop_threshold=car_detector_config.get("relative_drop_threshold", 0.3),
-        )
-        print(f"  [Car] 深度车辆检测已启用")
-
-    # 初始化 MOG2 运动检测器
-    motion_detector = None
-    mog2_config = car_detector_config.get("mog2", {}) if car_detector_config else {}
-    mog2_enabled = mog2_config.get("enabled", True) if mog2_config else True
-
-    # 初始化亮度监听器（依赖 mog2_config，需在之后）
-    brightness_monitor = None
-    if mog2_enabled and pixel_points:
-        mog2_bright_cfg = mog2_config.get("brightness", {})
-        brightness_monitor = BrightnessMonitor(
-            bright_high=mog2_bright_cfg.get("bright_high", 180.0),
-            bright_mid=mog2_bright_cfg.get("bright_mid", 80.0),
-            min_weight=mog2_bright_cfg.get("min_weight", 0.4),
-            max_weight=mog2_bright_cfg.get("max_weight", 1.0),
-            weight_alpha=mog2_bright_cfg.get("weight_alpha", 0.05),
-            log_interval=mog2_bright_cfg.get("log_interval", 50),
-        )
-
-    if mog2_enabled and pixel_points:
-        detect_x = pixel_points[0][0] if pixel_points else 40
-        motion_detector = MotionLineDetector(
-            detect_x=detect_x,
-            strip_width=mog2_config.get("strip_width", 30),
-            min_motion_pixels=mog2_config.get("min_motion_pixels", 50),
-            history=mog2_config.get("history", 300),
-            var_threshold=mog2_config.get("var_threshold", 25),
-            detect_shadow=mog2_config.get("detect_shadow", False),
-            warmup_frames=mog2_config.get("warmup_frames", 30),
-            confirm_frames=mog2_config.get("confirm_frames", 3),
-            brightness_monitor=brightness_monitor,
-        )
-        print(f"  [MOG2] 运动检测已启用 | 检测线 x={detect_x}, 带宽={mog2_config.get('strip_width', 30)}px, 确认={mog2_config.get('confirm_frames', 3)}帧")
-        if brightness_monitor:
-            print(f"  [亮度] 动态权重已启用 | 白天≥{brightness_monitor.bright_high}→权重={brightness_monitor.min_weight:.1f} | 夜间<{brightness_monitor.bright_mid}→权重={brightness_monitor.max_weight:.1f}")
+    # 初始化检测流水线（深度车辆检测器 + 亮度监听 + MOG2 运动检测）
+    effective_fps = fps / frame_step if fps > 0 and frame_step > 0 else fps
+    detector, brightness_monitor, motion_detector = build_detector_pipeline(
+        car_detector_config, pixel_points, effective_fps, verbose="basic")
 
     # 缩放比例（如果画面太大，缩放到合适尺寸显示）
     max_display_w = 1920
@@ -2080,30 +2432,11 @@ def preview_video(model, processor, video_path, device,
                 break
 
             if frame_idx % frame_step == 0:
-                img_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-                inputs = processor(images=[img_rgb], return_tensors="pt").to(device)
-
-                t0 = time.time()
-                with torch.no_grad():
-                    outputs = model(**inputs)
-                    depth = outputs.predicted_depth
-                frame_time = (time.time() - t0) * 1000
-
-                if depth.dim() == 3:
-                    depth = depth.unsqueeze(1)
-                depth = torch.nn.functional.interpolate(
-                    depth, size=(h, w), mode="bicubic", align_corners=False
-                ).squeeze().cpu().numpy()
+                depth, frame_time = _infer_depth_map(model, processor, frame, device)
 
                 depth_vis, d_min, d_max = depth_to_colormap(depth)
 
-                pixel_depths = []
-                if pixel_points:
-                    for px, py in pixel_points:
-                        if 0 <= px < w and 0 <= py < h:
-                            pixel_depths.append(float(depth[py, px]))
-                        else:
-                            pixel_depths.append(None)
+                pixel_depths = _extract_pixel_depths(depth, pixel_points or [])
 
                 # 车辆检测（深度 + MOG2 融合）
                 car_state = None

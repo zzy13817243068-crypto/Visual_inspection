@@ -4,7 +4,7 @@ import os
 import shutil
 import random
 
-PROJECT_ROOT = "/home/fst/zzy work/yolov26"
+PROJECT_ROOT = os.path.dirname(os.path.abspath(__file__))
 
 label_file_dir = os.path.join(PROJECT_ROOT, 'dataset/labels_raw/')
 images_file_dir = os.path.join(PROJECT_ROOT, 'dataset/images_raw/')
